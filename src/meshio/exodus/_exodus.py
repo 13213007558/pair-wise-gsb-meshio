@@ -12,10 +12,10 @@ import re
 import numpy as np
 
 from ..__about__ import __version__
-from .._common import warn
+from .._common import local_faces, warn
 from .._exceptions import ReadError
 from .._helpers import register_format
-from .._mesh import Mesh
+from .._mesh import Mesh, SideSet
 
 exodus_to_meshio_type = {
     "SPHERE": "vertex",
@@ -62,6 +62,8 @@ exodus_to_meshio_type = {
     #
     "PYRAMID": "pyramid",
     "WEDGE": "wedge",
+    "WEDGE15": "wedge15",
+    "WEDGE18": "wedge18",
 }
 meshio_to_exodus_type = {v: k for k, v in exodus_to_meshio_type.items()}
 
@@ -89,6 +91,11 @@ def read(filename):  # noqa: C901
         ns = []
         point_sets = {}
         info = []
+        ss_names = []
+        ss_ids = []
+        ss_elem = {}
+        ss_side = {}
+        ss_df = {}
 
         for key, value in nc.variables.items():
             if key == "info_records":
@@ -149,6 +156,19 @@ def read(filename):  # noqa: C901
             #     eb_names = [b"".join(c).decode("UTF-8") for c in value[:]]
             elif key.startswith("node_ns"):  # Expected keys: node_ns1, node_ns2
                 ns.append(value[:] - 1)  # Exodus is 1-based
+            elif key == "ss_names":
+                value.set_auto_mask(False)
+                ss_names = [b"".join(c).decode("UTF-8") for c in value[:]]
+            elif key == "ss_prop1":
+                ss_ids = [int(v) for v in value[:]]
+            elif key.startswith("elem_ss"):  # Expected keys: elem_ss1, elem_ss2
+                # Exodus element IDs are 1-based and global over all blocks
+                ss_elem[int(key[7:]) - 1] = value[:] - 1
+            elif key.startswith("side_ss"):  # Expected keys: side_ss1, side_ss2
+                # Exodus side numbers are 1-based
+                ss_side[int(key[7:]) - 1] = value[:] - 1
+            elif key.startswith("dist_fact_ss"):
+                ss_df[int(key[12:]) - 1] = value[:]
 
         # merge element block data; can't handle blocks yet
         for k, value in cd.items():
@@ -178,14 +198,88 @@ def read(filename):  # noqa: C901
 
         point_sets = {name: dat for name, dat in zip(ns_names, ns)}
 
+        side_sets = {}
+        if ss_elem:
+            side_sets = _read_side_sets(
+                cells, ss_elem, ss_side, ss_df, ss_names, ss_ids
+            )
+
     return Mesh(
         points,
         cells,
         point_data=point_data,
         cell_data=cell_data,
         point_sets=point_sets,
+        side_sets=side_sets,
         info=info,
     )
+
+
+def _read_side_sets(cells, ss_elem, ss_side, ss_df, ss_names, ss_ids):
+    # global element IDs run consecutively over all element blocks
+    block_sizes = [len(data) for _, data in cells]
+    offsets = np.concatenate([[0], np.cumsum(block_sizes)])
+    num_elem = offsets[-1]
+
+    side_sets = {}
+    for k in sorted(ss_elem):
+        elem_ids = np.asarray(ss_elem[k])
+        side_ids = np.asarray(ss_side[k])
+        if len(elem_ids) != len(side_ids):
+            raise ReadError(
+                f"Side set {k + 1}: {len(elem_ids)} elements, "
+                f"but {len(side_ids)} sides."
+            )
+        if np.any(elem_ids < 0) or np.any(elem_ids >= num_elem):
+            raise ReadError(
+                f"Side set {k + 1} refers to an element ID outside the "
+                f"valid range [1, {num_elem}]."
+            )
+
+        # map global element IDs to (block, local index)
+        block_ids = np.searchsorted(offsets[1:], elem_ids, side="right")
+        # number of face nodes per side, in the original (file) side order
+        df_counts = np.array(
+            [
+                len(local_faces[cells[b][0]][s])
+                for b, s in zip(block_ids, side_ids)
+            ]
+        )
+        # group sides by block, keeping the original order within each block
+        order = np.argsort(block_ids, kind="stable")
+        elem_ids = elem_ids[order]
+        side_ids = side_ids[order]
+        block_ids = block_ids[order]
+
+        data = []
+        for b in range(len(cells)):
+            mask = block_ids == b
+            data.append(
+                np.column_stack([elem_ids[mask] - offsets[b], side_ids[mask]])
+            )
+
+        name = ss_names[k] if k < len(ss_names) else None
+        set_id = ss_ids[k] if k < len(ss_ids) else k + 1
+        if name is None:
+            name = f"side_set_{set_id}"
+
+        df = ss_df.get(k)
+        if df is not None:
+            # The distribution factors are stored per side, one value per face
+            # node, in the original (ungrouped) side order. Reorder them into
+            # the block-grouped order.
+            if int(df_counts.sum()) != len(df):
+                raise ReadError(
+                    f"Side set '{name}' has {len(df)} distribution factors, "
+                    f"but its {len(elem_ids)} sides have "
+                    f"{int(df_counts.sum())} face nodes in total."
+                )
+            segments = np.split(df, np.cumsum(df_counts)[:-1])
+            df = np.concatenate([segments[i] for i in order]) if len(df) else df
+
+        side_sets[name] = SideSet(data, id=set_id, distribution_factors=df)
+
+    return side_sets
 
 
 def categorize(names):
@@ -368,6 +462,61 @@ def write(filename, mesh):
                 data = rootgrp.createVariable(f"node_ns{k + 1}", dtype, (dim1,))
                 # Exodus is 1-based
                 data[:] = values + 1
+
+        # side sets
+        mesh._validate_side_sets()
+        # skip empty side sets; a zero-length dimension would become an
+        # (illegal second) unlimited dimension in the netCDF file
+        side_sets = {
+            name: side_set for name, side_set in mesh.side_sets.items()
+        }
+        for name, side_set in side_sets.items():
+            if len(side_set) == 0:
+                warn(f"Skipping empty side set '{name}'.")
+        side_sets = {
+            name: side_set
+            for name, side_set in side_sets.items()
+            if len(side_set) > 0
+        }
+        num_side_sets = len(side_sets)
+        if num_side_sets > 0:
+            rootgrp.createDimension("num_side_sets", num_side_sets)
+            data = rootgrp.createVariable("ss_prop1", "i4", "num_side_sets")
+            data_names = rootgrp.createVariable(
+                "ss_names", "S1", ("num_side_sets", "len_string")
+            )
+            data_names.set_auto_mask(False)
+            # global element IDs run consecutively over all element blocks
+            offsets = np.concatenate(
+                [[0], np.cumsum([c.data.shape[0] for c in mesh.cells])]
+            )
+            for k, (name, side_set) in enumerate(side_sets.items()):
+                data[k] = side_set.id if side_set.id is not None else k + 1
+                for i, letter in enumerate(name):
+                    data_names[k, i] = letter.encode()
+                elem_ids = []
+                side_ids = []
+                for b, sides in enumerate(side_set.data):
+                    for cell_index, face_index in sides:
+                        # Exodus is 1-based
+                        elem_ids.append(offsets[b] + cell_index + 1)
+                        side_ids.append(face_index + 1)
+                dim = f"num_elem_ss{k + 1}"
+                rootgrp.createDimension(dim, len(elem_ids))
+                elem_var = rootgrp.createVariable(f"elem_ss{k + 1}", "i4", (dim,))
+                elem_var[:] = elem_ids
+                side_var = rootgrp.createVariable(f"side_ss{k + 1}", "i4", (dim,))
+                side_var[:] = side_ids
+                if side_set.distribution_factors is not None:
+                    df = side_set.distribution_factors
+                    df_dim = f"num_df_ss{k + 1}"
+                    rootgrp.createDimension(df_dim, len(df))
+                    df_var = rootgrp.createVariable(
+                        f"dist_fact_ss{k + 1}",
+                        numpy_to_exodus_dtype[df.dtype.name],
+                        (df_dim,),
+                    )
+                    df_var[:] = df
 
 
 register_format("exodus", [".e", ".exo", ".ex2"], read, {"exodus": write})

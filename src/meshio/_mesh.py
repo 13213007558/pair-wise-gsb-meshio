@@ -5,7 +5,7 @@ import copy
 import numpy as np
 from numpy.typing import ArrayLike
 
-from ._common import num_nodes_per_cell, warn
+from ._common import local_faces, num_nodes_per_cell, warn
 
 topological_dimension = {
     "line": 1,
@@ -113,6 +113,44 @@ class CellBlock:
         return len(self.data)
 
 
+class SideSet:
+    """A set of element faces (sides), e.g. an Exodus side set.
+
+    The sides are stored per cell block: data[k] is an (n, 2) integer array
+    whose rows are (cell_index, face_index) pairs referring to the k-th cell
+    block of the mesh. face_index is the local face number of the cell (see
+    meshio._common.local_faces). distribution_factors holds one value per node
+    of each side (in the order of the oriented face nodes), concatenated over
+    all sides of the set.
+    """
+
+    def __init__(
+        self,
+        data: list[ArrayLike],
+        id: int | None = None,
+        distribution_factors: ArrayLike | None = None,
+    ):
+        self.data = [np.asarray(d, dtype=int).reshape(-1, 2) for d in data]
+        self.id = id
+        self.distribution_factors = (
+            None
+            if distribution_factors is None
+            else np.asarray(distribution_factors, dtype=float)
+        )
+
+    def __repr__(self):
+        num_sides = sum(len(d) for d in self.data)
+        items = [
+            "meshio SideSet",
+            f"id: {self.id}",
+            f"num sides: {num_sides}",
+        ]
+        return "<" + ", ".join(items) + ">"
+
+    def __len__(self):
+        return sum(len(d) for d in self.data)
+
+
 class Mesh:
     def __init__(
         self,
@@ -123,6 +161,7 @@ class Mesh:
         field_data=None,
         point_sets: dict[str, ArrayLike] | None = None,
         cell_sets: dict[str, list[ArrayLike]] | None = None,
+        side_sets: dict[str, SideSet] | None = None,
         gmsh_periodic=None,
         info=None,
     ):
@@ -156,6 +195,7 @@ class Mesh:
         self.field_data = {} if field_data is None else field_data
         self.point_sets = {} if point_sets is None else point_sets
         self.cell_sets = {} if cell_sets is None else cell_sets
+        self.side_sets = {} if side_sets is None else side_sets
         self.gmsh_periodic = gmsh_periodic
         self.info = info
 
@@ -181,10 +221,69 @@ class Mesh:
                 if len(data[k]) != len(self.cells[k]):
                     raise ValueError(
                         "Incompatible cell data. "
-                        + f"Cell block {k} ('{self.cells[k].type}') "
-                        + f"has length {len(self.cells[k])}, but "
-                        + f"corresponding cell data item has length {len(data[k])}."
+                    + f"Cell block {k} ('{self.cells[k].type}') "
+                    + f"has length {len(self.cells[k])}, but "
+                    + f"corresponding cell data item has length {len(data[k])}."
+                )
+
+        self._validate_side_sets()
+
+    def _validate_side_sets(self):
+        for name, side_set in self.side_sets.items():
+            if len(side_set.data) != len(self.cells):
+                raise ValueError(
+                    f"Side set '{name}' has {len(side_set.data)} blocks, "
+                    f"but the mesh has {len(self.cells)} cell blocks."
+                )
+            num_df_expected = 0
+            for k, (cell_block, sides) in enumerate(zip(self.cells, side_set.data)):
+                if len(sides) == 0:
+                    continue
+                if cell_block.type not in local_faces:
+                    raise ValueError(
+                        f"Side set '{name}' refers to cell block {k} of type "
+                        f"'{cell_block.type}' for which no local face table is "
+                        "known."
                     )
+                faces = local_faces[cell_block.type]
+                cell_indices = sides[:, 0]
+                face_indices = sides[:, 1]
+                if np.any(cell_indices < 0) or np.any(
+                    cell_indices >= len(cell_block)
+                ):
+                    raise ValueError(
+                        f"Side set '{name}' refers to a cell index out of range "
+                        f"in cell block {k} ('{cell_block.type}')."
+                    )
+                if np.any(face_indices < 0) or np.any(face_indices >= len(faces)):
+                    raise ValueError(
+                        f"Side set '{name}' refers to a face index out of range "
+                        f"for cell type '{cell_block.type}' (block {k})."
+                    )
+                num_df_expected += sum(len(faces[i]) for i in face_indices)
+            if side_set.distribution_factors is not None:
+                num_df = len(side_set.distribution_factors)
+                if num_df != num_df_expected:
+                    raise ValueError(
+                        f"Side set '{name}' has {num_df} distribution factors, "
+                        f"but its {len(side_set)} sides have "
+                        f"{num_df_expected} face nodes in total."
+                    )
+
+    def get_side_set_nodes(self, name: str) -> list[np.ndarray]:
+        """Return the oriented face node indices for each side of a side set.
+
+        Returns one array of point indices per side, in the order the sides are
+        stored (block by block). The nodes of each side follow the local face
+        ordering of the cell type (see meshio._common.local_faces).
+        """
+        side_set = self.side_sets[name]
+        out = []
+        for cell_block, sides in zip(self.cells, side_set.data):
+            faces = local_faces[cell_block.type]
+            for cell_index, face_index in sides:
+                out.append(cell_block.data[cell_index][list(faces[face_index])])
+        return out
 
     def __repr__(self):
         lines = ["<meshio mesh object>", f"  Number of points: {len(self.points)}"]
@@ -216,6 +315,10 @@ class Mesh:
         if self.cell_sets:
             names = ", ".join(self.cell_sets.keys())
             lines.append(f"  Cell sets: {names}")
+
+        if self.side_sets:
+            names = ", ".join(self.side_sets.keys())
+            lines.append(f"  Side sets: {names}")
 
         if self.point_data:
             names = ", ".join(self.point_data.keys())

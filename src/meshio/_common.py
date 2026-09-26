@@ -87,6 +87,79 @@ num_nodes_per_cell = {
 }
 
 
+# Local faces of 3D cell types, given as tuples of local node indices. The face
+# (side) numbering and the node order within each face follow the Exodus II
+# conventions (see the Exodus II manual, appendix on side sets), so that side set
+# side numbers map directly onto these tables. Each face is oriented such that its
+# nodes are listed in the Exodus order for that side.
+local_faces = {
+    "tetra": (
+        (0, 1, 3),
+        (1, 2, 3),
+        (0, 3, 2),
+        (0, 2, 1),
+    ),
+    "tetra10": (
+        (0, 1, 3, 4, 8, 7),
+        (1, 2, 3, 5, 9, 8),
+        (0, 3, 2, 7, 9, 6),
+        (0, 2, 1, 6, 5, 4),
+    ),
+    "hexahedron": (
+        (0, 1, 5, 4),
+        (1, 2, 6, 5),
+        (2, 3, 7, 6),
+        (0, 3, 7, 4),
+        (0, 3, 2, 1),
+        (4, 5, 6, 7),
+    ),
+    "hexahedron20": (
+        (0, 1, 5, 4, 8, 17, 13, 16),
+        (1, 2, 6, 5, 9, 18, 14, 17),
+        (2, 3, 7, 6, 10, 19, 15, 18),
+        (0, 3, 7, 4, 11, 19, 15, 16),
+        (0, 3, 2, 1, 11, 10, 9, 8),
+        (4, 5, 6, 7, 12, 13, 14, 15),
+    ),
+    "hexahedron27": (
+        (0, 1, 5, 4, 8, 17, 13, 16, 20),
+        (1, 2, 6, 5, 9, 18, 14, 17, 21),
+        (2, 3, 7, 6, 10, 19, 15, 18, 22),
+        (0, 3, 7, 4, 11, 19, 15, 16, 23),
+        (0, 3, 2, 1, 11, 10, 9, 8, 24),
+        (4, 5, 6, 7, 12, 13, 14, 15, 25),
+    ),
+    "wedge": (
+        (0, 1, 4, 3),
+        (1, 2, 5, 4),
+        (0, 3, 5, 2),
+        (0, 2, 1),
+        (3, 4, 5),
+    ),
+    "wedge15": (
+        (0, 1, 4, 3, 6, 13, 9, 12),
+        (1, 2, 5, 4, 7, 14, 10, 13),
+        (0, 3, 5, 2, 12, 11, 14, 8),
+        (0, 2, 1, 8, 7, 6),
+        (3, 4, 5, 9, 10, 11),
+    ),
+    "wedge18": (
+        (0, 1, 4, 3, 6, 13, 9, 12, 15),
+        (1, 2, 5, 4, 7, 14, 10, 13, 16),
+        (0, 3, 5, 2, 12, 11, 14, 8, 17),
+        (0, 2, 1, 8, 7, 6),
+        (3, 4, 5, 9, 10, 11),
+    ),
+    "pyramid": (
+        (0, 1, 4),
+        (1, 2, 4),
+        (2, 3, 4),
+        (0, 4, 3),
+        (0, 3, 2, 1),
+    ),
+}
+
+
 def cell_data_from_raw(cells, cell_data_raw):
     cs = np.cumsum([len(c) for c in cells])[:-1]
     return {name: np.split(d, cs) for name, d in cell_data_raw.items()}
