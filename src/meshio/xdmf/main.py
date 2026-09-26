@@ -25,6 +25,93 @@ from .common import (
     xdmf_to_numpy_type,
 )
 
+# Structured topologies. Unlike the unstructured types they don't list node
+# indices explicitly; the connectivity is implied by the Dimensions.
+structured_topology_types = {
+    "2DCoRectMesh",
+    "2DRectMesh",
+    "2DSMesh",
+    "3DCoRectMesh",
+    "3DRectMesh",
+    "3DSMesh",
+}
+
+
+def _reshape_structured_data(data, dims, center):
+    # Data on a structured grid is stored with the topology axes reversed
+    # (last axis varies fastest), mirroring the C order of the coordinate
+    # array. Flatten to (num_items, ...).
+    if center == "Node":
+        shape = tuple(reversed(dims))
+    else:
+        shape = tuple(max(d - 1, 1) for d in reversed(dims))
+
+    num_items = int(np.prod(shape))
+    if data.shape[: len(shape)] != shape and data.shape[0] != num_items:
+        raise ReadError(
+            "Structured grid attribute dimensions "
+            f"{' '.join(str(s) for s in data.shape)} don't match the "
+            f"grid dimensions {' '.join(str(s) for s in shape)}."
+        )
+    return data.reshape((num_items,) + data.shape[len(shape) :])
+
+
+def _structured_cells(dims):
+    ndim = len(dims)
+    active_axes = [a for a in range(ndim) if dims[a] > 1]
+    zero = [0] * ndim
+
+    # Corner offsets of one element in VTK/meshio node order.
+    if len(active_axes) == 0:
+        return [CellBlock("vertex", np.array([[0]]))]
+    elif len(active_axes) == 1:
+        cell_type = "line"
+        corner_offsets = []
+        for step in (0, 1):
+            offset = list(zero)
+            offset[active_axes[0]] = step
+            corner_offsets.append(tuple(offset))
+    elif len(active_axes) == 2:
+        cell_type = "quad"
+        corner_offsets = []
+        for first, second in [(0, 0), (1, 0), (1, 1), (0, 1)]:
+            offset = list(zero)
+            offset[active_axes[0]] = first
+            offset[active_axes[1]] = second
+            corner_offsets.append(tuple(offset))
+    else:
+        cell_type = "hexahedron"
+        corner_offsets = [
+            (0, 0, 0),
+            (1, 0, 0),
+            (1, 1, 0),
+            (0, 1, 0),
+            (0, 0, 1),
+            (1, 0, 1),
+            (1, 1, 1),
+            (0, 1, 1),
+        ]
+
+    # Node ids follow node(i, j, k) = i + n_i * (j + n_j * k). Build the
+    # origin-corner id of every cell and add the corner offsets.
+    strides = np.cumprod([1, *dims[:-1]]).astype(np.int64)
+    cell_shape = tuple(max(d - 1, 1) for d in dims)
+    indices = np.indices(cell_shape)
+    base = np.zeros(cell_shape, dtype=np.int64)
+    for axis in range(ndim):
+        base += indices[axis] * strides[axis]
+
+    corner_ids = [
+        sum(offset[axis] * strides[axis] for axis in range(ndim))
+        for offset in corner_offsets
+    ]
+    # Fortran order: axis 0 varies fastest, matching both the node numbering
+    # and cell-centered attributes whose dimensions are reversed.
+    connectivity = np.column_stack(
+        [(base + corner_id).ravel(order="F") for corner_id in corner_ids]
+    )
+    return [CellBlock(cell_type, connectivity)]
+
 
 def read(filename):
     return XdmfReader(filename).read()
@@ -129,6 +216,157 @@ class XdmfReader:
             field_data[str_tag] = np.array([num_tag, dim])
         return field_data
 
+    def _read_structured_grid(self, grid, topology, is_xdmf2):
+        # Structured grids (CoRectMesh, RectMesh, SMesh) define the cells
+        # implicitly through their Dimensions. Expand them into an explicit
+        # unstructured `Mesh`.
+        #
+        # The Topology Dimensions are (n_i, n_j[, n_k]) with i the fastest
+        # varying axis. Coordinate and attribute arrays are stored with the
+        # axes reversed, i.e. the last dimension varies fastest, which is the
+        # usual C order. The implicit node numbering is
+        #   node(i, j[, k]) = i + n_i * (j + n_j * k)
+        dimensions = topology.attrib.get("Dimensions")
+        if dimensions is None:
+            raise ReadError("Structured grid <Topology> needs Dimensions.")
+        dims = [int(d) for d in dimensions.split()]
+        if len(dims) not in (2, 3):
+            raise ReadError(
+                "XDMF reader: Only 2D and 3D structured meshes are supported."
+            )
+        if any(d < 1 for d in dims):
+            raise ReadError("Structured grid Dimensions must be positive.")
+
+        geometry = None
+        attributes = []
+        field_data = {}
+        for c in grid:
+            if c.tag == "Topology":
+                continue
+            elif c.tag == "Geometry":
+                if geometry is not None:
+                    raise ReadError()
+                geometry = c
+            elif c.tag == "Attribute":
+                attributes.append(c)
+            elif c.tag == "Information":
+                c_data = c.text
+                if not c_data:
+                    raise ReadError()
+                field_data = self.read_information(c_data)
+            else:
+                raise ReadError(f"Unknown section '{c.tag}'.")
+
+        if geometry is None:
+            raise ReadError("Structured grid needs a <Geometry> section.")
+
+        points = self._read_structured_geometry(geometry, dims)
+        cells = _structured_cells(dims)
+
+        point_data = {}
+        cell_data_raw = {}
+        for attribute in attributes:
+            data_items = list(attribute)
+            if len(data_items) != 1:
+                raise ReadError()
+            data = self._read_data_item(data_items[0])
+
+            name = attribute.attrib["Name"]
+            center = attribute.attrib["Center"]
+            if center == "Node":
+                point_data[name] = _reshape_structured_data(data, dims, center)
+            elif center == "Cell":
+                cell_data_raw[name] = _reshape_structured_data(data, dims, center)
+            elif is_xdmf2 and center == "Grid":
+                # TODO field data?
+                continue
+            else:
+                raise ReadError(f"Unknown center '{center}'.")
+
+        cell_data = cell_data_from_raw(cells, cell_data_raw)
+
+        return Mesh(
+            points,
+            cells,
+            point_data=point_data,
+            cell_data=cell_data,
+            field_data=field_data,
+        )
+
+    def _read_structured_geometry(self, geometry, dims):
+        ndim = len(dims)
+
+        if "Type" in geometry.attrib and "GeometryType" in geometry.attrib:
+            raise ReadError()
+        geo_type = geometry.attrib.get("Type", geometry.attrib.get("GeometryType"))
+        if geo_type is None:
+            raise ReadError("Structured grid <Geometry> needs a type.")
+        geo_type = geo_type.upper()
+
+        data_items = list(geometry)
+
+        if geo_type in ("ORIGIN_DXDYDZ", "ORIGIN_DXDY"):
+            # Uniform spacing: origin and per-axis displacement vectors.
+            if len(data_items) != 2:
+                raise ReadError(
+                    f"{geo_type} geometry needs exactly 2 DataItems "
+                    "(origin and displacement)."
+                )
+            origin = np.asarray(
+                self._read_data_item(data_items[0]), dtype=float
+            ).ravel()
+            displacement = np.asarray(
+                self._read_data_item(data_items[1]), dtype=float
+            ).ravel()
+            if origin.size != ndim or displacement.size != ndim:
+                raise ReadError(
+                    f"{geo_type} origin/displacement vectors must have {ndim} "
+                    "entries."
+                )
+            axes = [
+                origin[axis] + displacement[axis] * np.arange(dims[axis])
+                for axis in range(ndim)
+            ]
+        elif geo_type in ("VXVYVZ", "VXVY"):
+            # One coordinate vector per axis: VX (i), VY (j), VZ (k).
+            if len(data_items) != ndim:
+                raise ReadError(
+                    f"{geo_type} geometry needs {ndim} DataItems, "
+                    f"found {len(data_items)}."
+                )
+            axes = []
+            for axis, data_item in enumerate(data_items):
+                coordinates = np.asarray(
+                    self._read_data_item(data_item), dtype=float
+                ).ravel()
+                if coordinates.size != dims[axis]:
+                    raise ReadError(
+                        f"{geo_type} axis {axis} has {coordinates.size} entries, "
+                        f"expected {dims[axis]}."
+                    )
+                axes.append(coordinates)
+        elif geo_type in ("XYZ", "XY"):
+            # Explicit coordinates. The array has shape
+            # (n_k, n_j, n_i[, 3]) with i varying fastest.
+            if len(data_items) != 1:
+                raise ReadError()
+            data = np.asarray(self._read_data_item(data_items[0]), dtype=float)
+            num_points = int(np.prod(dims))
+            expected_shape = tuple(reversed(dims)) + (ndim,)
+            if data.shape != expected_shape and data.size != num_points * ndim:
+                raise ReadError(
+                    f"{geo_type} geometry dimensions don't match the "
+                    f"structured grid dimensions {dims}."
+                )
+            return data.reshape(num_points, ndim)
+        else:
+            raise ReadError(f'Illegal geometry type "{geo_type}".')
+
+        # Expand the per-axis coordinates. Fortran order keeps axis 0 (i) the
+        # fastest varying axis, matching the implicit node numbering.
+        grids = np.meshgrid(*axes, indexing="ij")
+        return np.column_stack([grid.ravel(order="F") for grid in grids])
+
     def read_xdmf2(self, root):  # noqa: C901
         domains = list(root)
         if len(domains) != 1:
@@ -147,6 +385,15 @@ class XdmfReader:
         if "GridType" in grid.attrib and grid.attrib["GridType"] != "Uniform":
             raise ReadError()
 
+        # Structured grids don't list cell connectivity explicitly.
+        for c in grid:
+            if c.tag != "Topology":
+                continue
+            topology_type = c.attrib.get("TopologyType", c.attrib.get("Type"))
+            if topology_type in structured_topology_types:
+                return self._read_structured_grid(grid, c, is_xdmf2=True)
+            break
+
         points = None
         cells = []
         point_data = {}
@@ -161,11 +408,6 @@ class XdmfReader:
                         "Need exactly 1 data item in <Topology>, "
                         f"found {len(data_items)}."
                     )
-                    if len(data_items) == 0:
-                        message += (
-                            "\nStructured meshes are not supported, see "
-                            "<https://github.com/nschloe/meshio/issues/404>."
-                        )
                     raise ReadError(message)
 
                 topology_type = c.attrib["TopologyType"]
@@ -244,6 +486,15 @@ class XdmfReader:
         grid = grids[0]
         if grid.tag != "Grid":
             raise ReadError()
+
+        # Structured grids don't list cell connectivity explicitly.
+        for c in grid:
+            if c.tag != "Topology":
+                continue
+            topology_type = c.attrib.get("Type", c.attrib.get("TopologyType"))
+            if topology_type in structured_topology_types:
+                return self._read_structured_grid(grid, c, is_xdmf2=False)
+            break
 
         points = None
         cells = []
