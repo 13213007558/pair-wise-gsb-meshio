@@ -5,7 +5,7 @@ import copy
 import numpy as np
 from numpy.typing import ArrayLike
 
-from ._common import num_nodes_per_cell, warn
+from ._common import local_faces, num_nodes_per_cell, warn
 
 topological_dimension = {
     "line": 1,
@@ -113,6 +113,44 @@ class CellBlock:
         return len(self.data)
 
 
+class SideSet:
+    """A set of element faces, typically used for boundary conditions.
+
+    'data' is a list of integer arrays of shape (n, 2), one per cell block of
+    the mesh. Each row refers to one face by the local cell index within the
+    block and the local face index (see meshio._common.local_faces).
+
+    'dist_facts' is None or a list (one entry per cell block) of lists of 1-D
+    float arrays, one per face, holding one distribution factor per face node.
+    Entries of shape (n, k) are split into rows automatically.
+    """
+
+    def __init__(
+        self,
+        data: list[ArrayLike],
+        id: int | None = None,
+        dist_facts: list | None = None,
+    ):
+        self.data = [np.asarray(block_data) for block_data in data]
+        self.id = id
+        if dist_facts is None:
+            self.dist_facts = None
+        else:
+            self.dist_facts = []
+            for block_df in dist_facts:
+                if isinstance(block_df, np.ndarray) and block_df.ndim == 2:
+                    block_df = list(block_df)
+                self.dist_facts.append([np.asarray(df, dtype=float) for df in block_df])
+
+    def __repr__(self):
+        items = [
+            "meshio SideSet",
+            f"id: {self.id}",
+            f"num faces: {sum(len(d) for d in self.data)}",
+        ]
+        return "<" + ", ".join(items) + ">"
+
+
 class Mesh:
     def __init__(
         self,
@@ -125,6 +163,7 @@ class Mesh:
         cell_sets: dict[str, list[ArrayLike]] | None = None,
         gmsh_periodic=None,
         info=None,
+        side_sets: dict[str, SideSet] | None = None,
     ):
         self.points = np.asarray(points)
         if isinstance(cells, dict):
@@ -156,6 +195,7 @@ class Mesh:
         self.field_data = {} if field_data is None else field_data
         self.point_sets = {} if point_sets is None else point_sets
         self.cell_sets = {} if cell_sets is None else cell_sets
+        self.side_sets = {} if side_sets is None else side_sets
         self.gmsh_periodic = gmsh_periodic
         self.info = info
 
@@ -185,6 +225,63 @@ class Mesh:
                         + f"has length {len(self.cells[k])}, but "
                         + f"corresponding cell data item has length {len(data[k])}."
                     )
+
+        self._validate_side_sets()
+
+    def _validate_side_sets(self):
+        for name, side_set in self.side_sets.items():
+            if len(side_set.data) != len(self.cells):
+                raise ValueError(
+                    f"Side set '{name}' has {len(side_set.data)} blocks, "
+                    f"but the mesh has {len(self.cells)} cell blocks."
+                )
+            for block_idx, (block_data, cell_block) in enumerate(
+                zip(side_set.data, self.cells)
+            ):
+                if block_data.size == 0:
+                    block_data = block_data.reshape(0, 2)
+                    side_set.data[block_idx] = block_data
+                if block_data.ndim != 2 or block_data.shape[1] != 2:
+                    raise ValueError(
+                        f"Side set '{name}', block {block_idx}: expected data "
+                        f"of shape (n, 2), got {block_data.shape}."
+                    )
+                if cell_block.type not in local_faces:
+                    raise ValueError(
+                        f"Side set '{name}': no local faces defined for cell "
+                        f"type '{cell_block.type}' (block {block_idx})."
+                    )
+                faces = local_faces[cell_block.type]
+                cell_idx = block_data[:, 0]
+                face_idx = block_data[:, 1]
+                if len(cell_idx) > 0 and (
+                    np.any(cell_idx < 0)
+                    or np.any(cell_idx >= len(cell_block))
+                    or np.any(face_idx < 0)
+                    or np.any(face_idx >= len(faces))
+                ):
+                    raise ValueError(
+                        f"Side set '{name}', block {block_idx} "
+                        f"('{cell_block.type}'): cell or face index out of "
+                        f"range."
+                    )
+                if side_set.dist_facts is None:
+                    continue
+                block_df = side_set.dist_facts[block_idx]
+                if len(block_df) != len(block_data):
+                    raise ValueError(
+                        f"Side set '{name}', block {block_idx}: "
+                        f"{len(block_df)} distribution factor arrays for "
+                        f"{len(block_data)} faces."
+                    )
+                for k, (df, (_, f)) in enumerate(zip(block_df, block_data)):
+                    num_face_nodes = len(faces[f])
+                    if len(df) != num_face_nodes:
+                        raise ValueError(
+                            f"Side set '{name}', block {block_idx}, face {k}: "
+                            f"{len(df)} distribution factors, but the face "
+                            f"has {num_face_nodes} nodes."
+                        )
 
     def __repr__(self):
         lines = ["<meshio mesh object>", f"  Number of points: {len(self.points)}"]
@@ -216,6 +313,10 @@ class Mesh:
         if self.cell_sets:
             names = ", ".join(self.cell_sets.keys())
             lines.append(f"  Cell sets: {names}")
+
+        if self.side_sets:
+            names = ", ".join(self.side_sets.keys())
+            lines.append(f"  Side sets: {names}")
 
         if self.point_data:
             names = ", ".join(self.point_data.keys())
@@ -249,6 +350,19 @@ class Mesh:
         return np.concatenate(
             [d for c, d in zip(self.cells, self.cell_data[name]) if c.type == cell_type]
         )
+
+    def get_side_set_face_nodes(self, name: str) -> list[np.ndarray]:
+        """Returns the oriented point indices of all faces in the side set
+        'name', one array per face, in the order the faces appear in the set.
+        Useful for assembling boundary conditions.
+        """
+        side_set = self.side_sets[name]
+        out = []
+        for block_data, cell_block in zip(side_set.data, self.cells):
+            faces = local_faces[cell_block.type]
+            for cell_idx, face_idx in block_data:
+                out.append(cell_block.data[cell_idx][faces[face_idx]])
+        return out
 
     @property
     def cells_dict(self):

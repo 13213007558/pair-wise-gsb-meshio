@@ -12,10 +12,10 @@ import re
 import numpy as np
 
 from ..__about__ import __version__
-from .._common import warn
-from .._exceptions import ReadError
+from .._common import local_faces, warn
+from .._exceptions import ReadError, WriteError
 from .._helpers import register_format
-from .._mesh import Mesh
+from .._mesh import Mesh, SideSet
 
 exodus_to_meshio_type = {
     "SPHERE": "vertex",
@@ -89,6 +89,11 @@ def read(filename):  # noqa: C901
         ns = []
         point_sets = {}
         info = []
+        ss_names = []
+        ss_ids = []
+        ss_elem = {}
+        ss_side = {}
+        ss_df = {}
 
         for key, value in nc.variables.items():
             if key == "info_records":
@@ -105,7 +110,7 @@ def read(filename):  # noqa: C901
                     info += [b"".join(c).decode("UTF-8") for c in val[:]]
             elif key[:7] == "connect":
                 meshio_type = exodus_to_meshio_type[value.elem_type.upper()]
-                cells.append((meshio_type, value[:] - 1))
+                cells.append((int(key[7:]) - 1, meshio_type, value[:] - 1))
             elif key == "coord":
                 points = nc.variables["coord"][:].T
             elif key == "coordx":
@@ -149,10 +154,27 @@ def read(filename):  # noqa: C901
             #     eb_names = [b"".join(c).decode("UTF-8") for c in value[:]]
             elif key.startswith("node_ns"):  # Expected keys: node_ns1, node_ns2
                 ns.append(value[:] - 1)  # Exodus is 1-based
+            elif key == "ss_names":
+                value.set_auto_mask(False)
+                ss_names = [
+                    b"".join(c).decode("UTF-8").rstrip("\x00") for c in value[:]
+                ]
+            elif key == "ss_prop1":
+                ss_ids = [int(v) for v in value[:]]
+            elif key.startswith("elem_ss"):  # Expected keys: elem_ss1, elem_ss2
+                ss_elem[int(key[7:]) - 1] = value[:] - 1  # Exodus is 1-based
+            elif key.startswith("side_ss"):  # Expected keys: side_ss1, side_ss2
+                ss_side[int(key[7:]) - 1] = value[:] - 1  # Exodus is 1-based
+            elif key.startswith("dist_fact_ss"):
+                ss_df[int(key[12:]) - 1] = value[:]
+
+        # sort cells by block index; the global element numbering used in side
+        # sets runs across the blocks in this order
+        cells = [(meshio_type, data) for _, meshio_type, data in sorted(cells)]
 
         # merge element block data; can't handle blocks yet
         for k, value in cd.items():
-            cd[k] = np.concatenate(list(value.values()))
+            cd[k] = np.concatenate([value[b] for b in sorted(value)])
 
         # Check if there are any <name>R, <name>Z tuples or <name>X, <name>Y, <name>Z
         # triplets in the point data. If yes, they belong together.
@@ -178,14 +200,86 @@ def read(filename):  # noqa: C901
 
         point_sets = {name: dat for name, dat in zip(ns_names, ns)}
 
+        side_sets = _read_side_sets(cells, ss_names, ss_ids, ss_elem, ss_side, ss_df)
+
     return Mesh(
         points,
         cells,
         point_data=point_data,
         cell_data=cell_data,
         point_sets=point_sets,
+        side_sets=side_sets,
         info=info,
     )
+
+
+def _read_side_sets(cells, ss_names, ss_ids, ss_elem, ss_side, ss_df):
+    # map the global (file) element numbers to (block, local cell) indices
+    block_sizes = [len(data) for _, data in cells]
+    offsets = np.concatenate([[0], np.cumsum(block_sizes)])
+
+    side_sets = {}
+    for k in sorted(ss_elem):
+        if k < len(ss_names):
+            name = ss_names[k]
+        elif k < len(ss_ids):
+            name = str(ss_ids[k])
+        else:
+            name = f"ss{k + 1}"
+
+        elems = ss_elem[k]
+        sides = ss_side[k]
+        if len(elems) > 0 and (np.any(elems < 0) or np.any(elems >= offsets[-1])):
+            raise ReadError(f"Side set '{name}': element number out of range.")
+
+        block_idx = np.searchsorted(offsets, elems, side="right") - 1
+        local_cells = elems - offsets[block_idx]
+
+        data = []
+        for b, (cell_type, _) in enumerate(cells):
+            mask = block_idx == b
+            block_sides = sides[mask]
+            if cell_type not in local_faces:
+                if np.any(mask):
+                    raise ReadError(
+                        f"Side set '{name}': no local faces defined for cell "
+                        f"type '{cell_type}'."
+                    )
+            elif len(block_sides) > 0 and (
+                np.any(block_sides < 0)
+                or np.any(block_sides >= len(local_faces[cell_type]))
+            ):
+                raise ReadError(
+                    f"Side set '{name}': side number out of range for cell "
+                    f"type '{cell_type}'."
+                )
+            data.append(np.column_stack([local_cells[mask], block_sides]))
+
+        dist_facts = None
+        if k in ss_df:
+            # split the flat distribution factor array into one array per
+            # face; each face contributes as many factors as it has nodes
+            df = ss_df[k]
+            counts = [
+                len(local_faces[cells[b][0]][s]) for b, s in zip(block_idx, sides)
+            ]
+            if len(df) != sum(counts):
+                raise ReadError(
+                    f"Side set '{name}': {len(df)} distribution factors, but "
+                    f"the {len(sides)} faces have {sum(counts)} nodes in "
+                    f"total."
+                )
+            split = np.split(df, np.cumsum(counts)[:-1])
+            dist_facts = [[] for _ in cells]
+            for b, df_face in zip(block_idx, split):
+                dist_facts[b].append(df_face)
+
+        side_sets[name] = SideSet(
+            data,
+            id=ss_ids[k] if k < len(ss_ids) else None,
+            dist_facts=dist_facts,
+        )
+    return side_sets
 
 
 def categorize(names):
@@ -277,6 +371,7 @@ def write(filename, mesh):
         rootgrp.createDimension("num_elem", total_num_elems)
         rootgrp.createDimension("num_el_blk", len(mesh.cells))
         rootgrp.createDimension("num_node_sets", len(mesh.point_sets))
+        rootgrp.createDimension("num_side_sets", len(mesh.side_sets))
         rootgrp.createDimension("len_string", 33)
         rootgrp.createDimension("len_line", 81)
         rootgrp.createDimension("four", 4)
@@ -368,6 +463,52 @@ def write(filename, mesh):
                 data = rootgrp.createVariable(f"node_ns{k + 1}", dtype, (dim1,))
                 # Exodus is 1-based
                 data[:] = values + 1
+
+        # side sets
+        num_side_sets = len(mesh.side_sets)
+        if num_side_sets > 0:
+            try:
+                mesh._validate_side_sets()
+            except ValueError as e:
+                raise WriteError(str(e)) from e
+
+            data = rootgrp.createVariable("ss_prop1", "i4", "num_side_sets")
+            data_names = rootgrp.createVariable(
+                "ss_names", "S1", ("num_side_sets", "len_string")
+            )
+            data_names.set_auto_mask(False)
+            # global element numbers run across the blocks in order
+            offsets = np.cumsum([0] + [len(c.data) for c in mesh.cells])
+            for k, (name, side_set) in enumerate(mesh.side_sets.items()):
+                data[k] = side_set.id if side_set.id is not None else k + 1
+                for i, letter in enumerate(name):
+                    data_names[k, i] = letter.encode()
+
+                elems = []
+                sides = []
+                dfs = []
+                for b, block_data in enumerate(side_set.data):
+                    elems.append(offsets[b] + block_data[:, 0])
+                    sides.append(block_data[:, 1])
+                    if side_set.dist_facts is not None:
+                        dfs += side_set.dist_facts[b]
+                elems = np.concatenate(elems) if elems else np.array([], int)
+                sides = np.concatenate(sides) if sides else np.array([], int)
+
+                dim1 = f"num_side_ss{k + 1}"
+                rootgrp.createDimension(dim1, len(elems))
+                dtype = numpy_to_exodus_dtype[elems.dtype.name]
+                # Exodus is 1-based
+                data = rootgrp.createVariable(f"elem_ss{k + 1}", dtype, (dim1,))
+                data[:] = elems + 1
+                data = rootgrp.createVariable(f"side_ss{k + 1}", dtype, (dim1,))
+                data[:] = sides + 1
+
+                if side_set.dist_facts is not None:
+                    dim2 = f"num_df_ss{k + 1}"
+                    rootgrp.createDimension(dim2, sum(len(df) for df in dfs))
+                    data = rootgrp.createVariable(f"dist_fact_ss{k + 1}", "f8", (dim2,))
+                    data[:] = np.concatenate(dfs) if dfs else np.array([], float)
 
 
 register_format("exodus", [".e", ".exo", ".ex2"], read, {"exodus": write})

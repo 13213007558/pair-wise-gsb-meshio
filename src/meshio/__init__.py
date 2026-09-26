@@ -41,7 +41,7 @@ from ._helpers import (
     write,
     write_points_cells,
 )
-from ._mesh import CellBlock, Mesh
+from ._mesh import CellBlock, Mesh, SideSet
 
 __all__ = [
     "abaqus",
@@ -83,6 +83,7 @@ __all__ = [
     "extension_to_filetypes",
     "Mesh",
     "CellBlock",
+    "SideSet",
     "ReadError",
     "WriteError",
     "topological_dimension",
