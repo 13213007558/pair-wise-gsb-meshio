@@ -1,7 +1,10 @@
+from xml.etree import ElementTree as ET
+
 import numpy as np
 import pytest
 
 import meshio
+from meshio._exceptions import ReadError
 
 from . import helpers
 
@@ -89,6 +92,128 @@ def test_time_series():
             assert np.abs(times[k] - t) < 1.0e-12
             for key, value in pd.items():
                 assert np.all(np.abs(value - point_data[k][key]) < 1.0e-12)
+
+
+def test_time_series_moving_and_remeshing_mesh(tmp_path):
+    filename = tmp_path / "moving-mesh.xdmf"
+
+    # step 0: initial mesh
+    points0 = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    cells0 = [("triangle", np.array([[0, 1, 2]]))]
+    # step 1: same topology, moved nodes
+    points1 = points0 + 0.5
+    # step 2: remeshed, different number of points and cells
+    points2 = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    cells2 = [("triangle", np.array([[0, 1, 2], [1, 3, 2]]))]
+
+    points_per_step = [points0, points1, points2]
+    cells_per_step = [cells0, cells0, cells2]
+    times = [0.0, 0.5, 1.0]
+    point_data = [
+        {"phi": np.full(len(points), t)}
+        for points, t in zip(points_per_step, times)
+    ]
+    cell_data = [
+        {"a": [np.full(len(cells[0][1]), t)]}
+        for cells, t in zip(cells_per_step, times)
+    ]
+
+    with meshio.xdmf.TimeSeriesWriter(filename, data_format="XML") as writer:
+        for k in range(3):
+            writer.write_data(
+                times[k],
+                point_data=point_data[k],
+                cell_data=cell_data[k],
+                points=points_per_step[k],
+                cells=cells_per_step[k],
+            )
+
+    # check the XML structure: step 1 must reference the topology of step 0,
+    # steps 0 and 2 define their mesh inline
+    tree = ET.parse(filename)
+    domain = tree.getroot().find("Domain")
+    collection = [g for g in domain if g.get("GridType") == "Collection"][0]
+    steps = list(collection)
+    assert len(steps) == 3
+    assert steps[0].find("Topology") is not None
+    assert steps[0].find("Geometry") is not None
+    # step 1 only redefines the geometry; the topology is referenced
+    assert steps[1].find("Topology") is None
+    assert steps[1].find("Geometry") is not None
+    includes = [c for c in steps[1] if c.tag.endswith("include")]
+    assert len(includes) == 1
+    ptr = includes[0].get("xpointer")
+    assert 'Grid[@Name="mesh_1"]' in ptr
+    assert ptr.endswith("/Topology)")
+    # step 2 is remeshed: full inline mesh
+    assert steps[2].find("Topology") is not None
+    assert steps[2].find("Geometry") is not None
+
+    # read everything back; read all steps before checking anything to make
+    # sure that reading a step doesn't modify the objects returned for the
+    # previous steps
+    with meshio.xdmf.TimeSeriesReader(filename) as reader:
+        assert reader.num_steps == 3
+        results = []
+        for k in range(reader.num_steps):
+            points, cells = reader.read_points_cells(k)
+            t, pd, cd = reader.read_data(k)
+            results.append((points, cells, t, pd, cd))
+
+    for k, (points, cells, t, pd, cd) in enumerate(results):
+        assert np.allclose(points, points_per_step[k])
+        assert len(cells) == 1
+        assert cells[0].type == "triangle"
+        assert np.array_equal(cells[0].data, cells_per_step[k][0][1])
+        assert np.abs(times[k] - t) < 1.0e-12
+        assert np.allclose(pd["phi"], point_data[k]["phi"])
+        assert np.allclose(cd["a"][0], cell_data[k]["a"][0])
+
+
+def test_time_series_moving_mesh_static_geometry(tmp_path):
+    # same topology throughout, only the coordinates change; write_data
+    # without points/cells must reference the previous step's mesh
+    filename = tmp_path / "moving-mesh2.xdmf"
+
+    points0 = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    cells = [("triangle", np.array([[0, 1, 2]]))]
+
+    with meshio.xdmf.TimeSeriesWriter(filename, data_format="XML") as writer:
+        writer.write_data(0.0, points=points0, cells=cells)
+        writer.write_data(0.5, points=points0 + 1.0)
+        writer.write_data(1.0)
+
+    with meshio.xdmf.TimeSeriesReader(filename) as reader:
+        assert reader.num_steps == 3
+        for k, offset in enumerate([0.0, 1.0, 1.0]):
+            points, cells_read = reader.read_points_cells(k)
+            assert np.allclose(points, points0 + offset)
+            assert np.array_equal(cells_read[0].data, cells[0][1])
+
+
+def test_time_series_data_mesh_mismatch(tmp_path):
+    points = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    cells = [("triangle", np.array([[0, 1, 2]]))]
+
+    # point_data not matching the number of points of the step
+    filename = tmp_path / "mismatch-point-data.xdmf"
+    with meshio.xdmf.TimeSeriesWriter(filename, data_format="XML") as writer:
+        writer.write_data(
+            0.0, point_data={"phi": np.zeros(4)}, points=points, cells=cells
+        )
+    with meshio.xdmf.TimeSeriesReader(filename) as reader:
+        with pytest.raises(ReadError):
+            reader.read_data(0)
+
+    # cell_data not matching the number of cells of the step
+    filename = tmp_path / "mismatch-cell-data.xdmf"
+    with meshio.xdmf.TimeSeriesWriter(filename, data_format="XML") as writer:
+        writer.write_data(
+            0.0, cell_data={"a": [np.zeros(2)]}, points=points, cells=cells
+        )
+    with meshio.xdmf.TimeSeriesReader(filename) as reader:
+        with pytest.raises(ReadError):
+            reader.read_data(0)
 
 
 # def test_information_xdmf():

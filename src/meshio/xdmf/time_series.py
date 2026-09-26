@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 from io import BytesIO
 from xml.etree import ElementTree as ET
 
@@ -20,6 +21,12 @@ from .common import (
     translate_mixed_cells,
     xdmf_to_meshio_type,
     xdmf_to_numpy_type,
+)
+
+# xpointer(//Grid[@Name="mesh"]/Topology),
+# xpointer(//Grid[@Name="mesh"]/*[self::Topology or self::Geometry]), ...
+_XPOINTER_RE = re.compile(
+    r"xpointer\(//Grid\[@Name=[\"'](?P<name>[^\"']+)[\"']\]/(?P<selector>[^)]+)\)"
 )
 
 
@@ -64,6 +71,7 @@ class TimeSeriesReader:
         self.num_steps = len(self.collection)
         self.cells = None
         self.hdf5_files = {}
+        self._step_meshes = {}
 
         # find the uniform grid
         self.mesh_grid = None
@@ -76,9 +84,7 @@ class TimeSeriesReader:
                 if g.get("GridType") == "Uniform":
                     self.mesh_grid = g
                     break
-        if self.mesh_grid is None:
-            raise ReadError("Couldn't find the mesh grid")
-        if self.mesh_grid.tag != "Grid":
+        if self.mesh_grid is not None and self.mesh_grid.tag != "Grid":
             raise ReadError()
 
     def __enter__(self):
@@ -89,12 +95,98 @@ class TimeSeriesReader:
         for f in self.hdf5_files.values():
             f.close()
 
-    def read_points_cells(self):
+    def read_points_cells(self, k: int | None = None):
+        """Read the points and cells of the mesh.
+
+        Without argument, read the static mesh of the time series (the
+        historical behavior). With a time step index `k`, read the mesh of
+        that particular step; every step may define its own Geometry and
+        Topology or reference parts of previously defined meshes.
+        """
+        if k is None:
+            if self.mesh_grid is None:
+                raise ReadError("Couldn't find the mesh grid")
+            points, cells = self._read_mesh_elements(
+                self._mesh_elements(self.mesh_grid)
+            )
+            self.cells = cells
+            return points, cells
+
+        mesh = self._read_step_mesh(k)
+        if mesh is None:
+            raise ReadError(f"Couldn't find mesh information for time step {k}")
+        return mesh
+
+    def _step_grid(self, k: int):
+        if not 0 <= k < self.num_steps:
+            raise ReadError(
+                f"Time step index {k} out of range ({self.num_steps} steps)"
+            )
+        return self.collection[k]
+
+    def _read_step_mesh(self, k: int):
+        """Return the (points, cells) of time step k, or None if the step
+        carries no mesh information and there is no static mesh."""
+        if k not in self._step_meshes:
+            elements = self._mesh_elements(self._step_grid(k))
+            if elements:
+                mesh = self._read_mesh_elements(elements)
+            elif self.mesh_grid is not None:
+                # fall back to the static mesh
+                mesh = self._read_mesh_elements(self._mesh_elements(self.mesh_grid))
+            else:
+                mesh = None
+            self._step_meshes[k] = mesh
+        return self._step_meshes[k]
+
+    def _mesh_elements(self, grid):
+        """Collect the Topology/Geometry elements of a grid, resolving
+        xi:include references to previously defined grids."""
+        elements = []
+        for child in grid:
+            # strip the namespace (relevant for xi:include)
+            tag = child.tag.split("}")[-1]
+            if tag in ["Topology", "Geometry"]:
+                elements.append(child)
+            elif tag == "include":
+                elements.extend(self._resolve_xpointer(child.attrib["xpointer"]))
+        return elements
+
+    def _resolve_xpointer(self, xpointer: str):
+        match = _XPOINTER_RE.fullmatch(xpointer.strip())
+        if match is None:
+            raise ReadError(f"Cannot parse xpointer '{xpointer}'")
+        name = match.group("name")
+        selector = match.group("selector")
+
+        # Find the referenced grid by its Name attribute. Many grids contain
+        # elements with identical tag names (Topology, Geometry), so the Name
+        # is the only reliable handle.
+        target = None
+        for g in list(self.domain) + self.collection:
+            if g.tag == "Grid" and g.get("Name") == name:
+                target = g
+                break
+        if target is None:
+            raise ReadError(f"Cannot resolve xpointer '{xpointer}'")
+
+        if selector == "*[self::Topology or self::Geometry]":
+            tags = ("Topology", "Geometry")
+        elif selector in ("Topology", "Geometry"):
+            tags = (selector,)
+        else:
+            raise ReadError(f"Unsupported xpointer selector '{selector}'")
+
+        elements = [c for c in target if c.tag in tags]
+        if not elements:
+            raise ReadError(f"Cannot resolve xpointer '{xpointer}'")
+        return elements
+
+    def _read_mesh_elements(self, elements):
         points = None
         cells = []
 
-        assert self.mesh_grid is not None
-        for c in self.mesh_grid:
+        for c in elements:
             if c.tag == "Topology":
                 data_items = list(c)
                 if len(data_items) != 1:
@@ -129,7 +221,6 @@ class TimeSeriesReader:
                 data_item = data_items[0]
                 points = self._read_data_item(data_item)
 
-        self.cells = cells
         return points, cells
 
     def read_data(self, k: int):
@@ -138,7 +229,7 @@ class TimeSeriesReader:
 
         t = None
 
-        for c in list(self.collection[k]):
+        for c in list(self._step_grid(k)):
             if c.tag == "Time":
                 t = float(c.attrib["Value"])
             elif c.tag == "Attribute":
@@ -156,12 +247,34 @@ class TimeSeriesReader:
                         raise ReadError()
                     cell_data_raw[name] = data
             else:
-                # skip the xi:included mesh
+                # skip the mesh (Topology/Geometry, possibly xi:included);
+                # it is handled by _read_step_mesh()
                 continue
 
-        if self.cells is None:
-            raise ReadError()
-        cell_data = cell_data_from_raw(self.cells, cell_data_raw)
+        mesh = self._read_step_mesh(k)
+        if mesh is None:
+            raise ReadError(f"Couldn't find mesh information for time step {k}")
+        points, cells = mesh
+
+        # check the data against the mesh of this time step
+        if points is not None:
+            num_points = points.shape[0]
+            for name, data in point_data.items():
+                if data.shape[0] != num_points:
+                    raise ReadError(
+                        f"Time step {k}: point_data '{name}' has "
+                        f"{data.shape[0]} entries, but the mesh has "
+                        f"{num_points} points"
+                    )
+        num_cells = sum(len(cell_block) for cell_block in cells)
+        for name, data in cell_data_raw.items():
+            if data.shape[0] != num_cells:
+                raise ReadError(
+                    f"Time step {k}: cell_data '{name}' has {data.shape[0]} "
+                    f"entries, but the mesh has {num_cells} cells"
+                )
+
+        cell_data = cell_data_from_raw(cells, cell_data_raw)
         if t is None:
             raise ReadError()
 
@@ -257,6 +370,14 @@ class TimeSeriesWriter:
 
         self.has_mesh = False
         self.mesh_name = "mesh"
+        self._mesh_counter = 0
+        # names of the grids holding the most recently defined
+        # Topology/Geometry; new time steps may reference them
+        self._topology_ref = None
+        self._geometry_ref = None
+        # (grid name, cell blocks) of all grids with an inline Topology,
+        # used to deduplicate identical topologies
+        self._topologies = []
 
     def __enter__(self):
         if self.data_format == "HDF":
@@ -287,11 +408,24 @@ class TimeSeriesWriter:
         grid = ET.SubElement(
             self.domain, "Grid", Name=self.mesh_name, GridType="Uniform"
         )
+        cell_blocks = self._to_cell_blocks(cells)
         self.points(grid, np.asarray(points))
-        self.cells(cells, grid)
+        self.cells(cell_blocks, grid)
         self.has_mesh = True
+        self._topology_ref = self.mesh_name
+        self._geometry_ref = self.mesh_name
+        self._topologies.append((self.mesh_name, cell_blocks))
 
-    def write_data(self, t, point_data=None, cell_data=None):
+    def write_data(self, t, point_data=None, cell_data=None, points=None, cells=None):
+        """Write the data of one time step.
+
+        Without `points`/`cells`, the step references the most recently
+        defined mesh (the static mesh written with `write_points_cells` for
+        static time series). Pass `points` to move the nodes of the current
+        mesh; pass `points` and `cells` for a completely new mesh. If the
+        given `cells` are identical to a previously written topology, only
+        a reference to that topology is written.
+        """
         cell_data = {} if cell_data is None else cell_data
         # <Grid>
         #   <xi:include xpointer="xpointer(//Grid[@Name=&quot;TimeSeries_phi&quot;]/Grid[1]/*[self::Topology or self::Geometry])" />
@@ -300,11 +434,62 @@ class TimeSeriesWriter:
         #     <DataItem Dimensions="8457 1" Format="HDF">maxwell.h5:/VisualisationVector/1</DataItem>
         #   </Attribute>
         # </Grid>
-        grid = ET.SubElement(self.collection, "Grid")
-        if not self.has_mesh:
-            raise WriteError()
-        ptr = f'xpointer(//Grid[@Name="{self.mesh_name}"]/*[self::Topology or self::Geometry])'
-        ET.SubElement(grid, "{http://www.w3.org/2003/XInclude}include", xpointer=ptr)
+        grid = ET.SubElement(self.collection, "Grid", GridType="Uniform")
+
+        if points is None and cells is None:
+            # reference the current mesh
+            if self._topology_ref is None or self._geometry_ref is None:
+                raise WriteError(
+                    "No mesh defined yet; call write_points_cells() first or "
+                    "pass points and cells"
+                )
+            if self._topology_ref == self._geometry_ref:
+                ptr = f'xpointer(//Grid[@Name="{self._topology_ref}"]/*[self::Topology or self::Geometry])'
+                self._include(grid, ptr)
+            else:
+                self._include(
+                    grid,
+                    f'xpointer(//Grid[@Name="{self._topology_ref}"]/Topology)',
+                )
+                self._include(
+                    grid,
+                    f'xpointer(//Grid[@Name="{self._geometry_ref}"]/Geometry)',
+                )
+        else:
+            # this step defines its own mesh, at least in part
+            self._mesh_counter += 1
+            grid_name = f"mesh_{self._mesh_counter}"
+            grid.set("Name", grid_name)
+            if points is not None:
+                self.points(grid, np.asarray(points))
+                self._geometry_ref = grid_name
+            else:
+                if self._geometry_ref is None:
+                    raise WriteError("No geometry defined yet; pass points")
+                self._include(
+                    grid,
+                    f'xpointer(//Grid[@Name="{self._geometry_ref}"]/Geometry)',
+                )
+            if cells is not None:
+                cell_blocks = self._to_cell_blocks(cells)
+                ref = self._find_topology(cell_blocks)
+                if ref is None:
+                    self.cells(cell_blocks, grid)
+                    self._topologies.append((grid_name, cell_blocks))
+                    self._topology_ref = grid_name
+                else:
+                    # same topology as before, only reference it
+                    self._include(
+                        grid, f'xpointer(//Grid[@Name="{ref}"]/Topology)'
+                    )
+            else:
+                if self._topology_ref is None:
+                    raise WriteError("No topology defined yet; pass cells")
+                self._include(
+                    grid,
+                    f'xpointer(//Grid[@Name="{self._topology_ref}"]/Topology)',
+                )
+
         ET.SubElement(grid, "Time", Value=str(t))
 
         if point_data:
@@ -316,6 +501,41 @@ class TimeSeriesWriter:
                 cell_data[name] = np.array(list(entry.values()))
         if cell_data:
             self.cell_data(cell_data, grid)
+
+    @staticmethod
+    def _include(grid, ptr: str) -> None:
+        ET.SubElement(grid, "{http://www.w3.org/2003/XInclude}include", xpointer=ptr)
+
+    @staticmethod
+    def _to_cell_blocks(cells) -> list:
+        if isinstance(cells, dict):
+            # convert dict to list of tuples
+            cells = list(cells.items())
+
+        # convert to cell_blocks
+        cell_blocks = []
+        for cell_block in cells:
+            if isinstance(cell_block, tuple):
+                cell_type, data = cell_block
+                cell_block = CellBlock(cell_type, np.asarray(data))
+            cell_blocks.append(cell_block)
+        return cell_blocks
+
+    def _find_topology(self, cell_blocks) -> str | None:
+        """Return the name of a grid whose Topology matches `cell_blocks`,
+        or None if there is none."""
+        for name, blocks in self._topologies:
+            if len(blocks) != len(cell_blocks):
+                continue
+            if all(
+                block.type == new_block.type
+                and block.data.shape == new_block.data.shape
+                and block.data.dtype == new_block.data.dtype
+                and np.array_equal(block.data, new_block.data)
+                for block, new_block in zip(blocks, cell_blocks)
+            ):
+                return name
+        return None
 
     def numpy_to_xml_string(self, data):
         if self.data_format == "XML":
@@ -364,17 +584,7 @@ class TimeSeriesWriter:
         cells: dict[str, ArrayLike] | list[tuple[str, ArrayLike] | CellBlock],
         grid: ET.Element,
     ) -> None:
-        if isinstance(cells, dict):
-            # convert dict to list of tuples
-            cells = list(cells.items())
-
-        # conver to cell_blocks
-        cell_blocks = []
-        for cell_block in cells:
-            if isinstance(cell_block, tuple):
-                cell_type, data = cell_block
-                cell_block = CellBlock(cell_type, np.asarray(data))
-            cell_blocks.append(cell_block)
+        cell_blocks = self._to_cell_blocks(cells)
 
         if len(cell_blocks) == 1:
             meshio_type = cell_blocks[0].type
