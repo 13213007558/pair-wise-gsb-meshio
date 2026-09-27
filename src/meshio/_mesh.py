@@ -124,6 +124,8 @@ class Mesh:
         point_sets: dict[str, ArrayLike] | None = None,
         cell_sets: dict[str, list[ArrayLike]] | None = None,
         gmsh_periodic=None,
+        gmsh_partitioned_entities=None,
+        gmsh_ghost_elements=None,
         info=None,
     ):
         self.points = np.asarray(points)
@@ -157,6 +159,8 @@ class Mesh:
         self.point_sets = {} if point_sets is None else point_sets
         self.cell_sets = {} if cell_sets is None else cell_sets
         self.gmsh_periodic = gmsh_periodic
+        self.gmsh_partitioned_entities = gmsh_partitioned_entities
+        self.gmsh_ghost_elements = gmsh_ghost_elements
         self.info = info
 
         # assert point data consistency and convert to numpy arrays

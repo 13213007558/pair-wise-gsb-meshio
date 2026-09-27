@@ -47,6 +47,8 @@ def read_buffer(f, is_ascii: bool, data_size):
     bounding_entities = None
     cell_sets = {}
     periodic = None
+    partitioned_entities = None
+    ghost_elements = None
     while True:
         # fast-forward over blank lines
         line, is_eof = _fast_forward_over_blank_lines(f)
@@ -64,10 +66,18 @@ def read_buffer(f, is_ascii: bool, data_size):
             # Read physical tags and information on bounding entities.
             # The information is passed to the processing of elements.
             physical_tags, bounding_entities = _read_entities(f, is_ascii, data_size)
+        elif environ == "PartitionedEntities":
+            # Like $Entities, but for partitioned meshes. Additionally reads the
+            # parent entities and the partitions of each entity.
+            (
+                physical_tags,
+                bounding_entities,
+                partitioned_entities,
+            ) = _read_partitioned_entities(f, is_ascii, data_size)
         elif environ == "Nodes":
             points, point_tags, point_entities = _read_nodes(f, is_ascii, data_size)
         elif environ == "Elements":
-            cells, cell_tags, cell_sets = _read_elements(
+            cells, cell_tags, cell_sets, element_tags = _read_elements(
                 f,
                 point_tags,
                 physical_tags,
@@ -76,6 +86,8 @@ def read_buffer(f, is_ascii: bool, data_size):
                 data_size,
                 field_data,
             )
+        elif environ == "GhostElements":
+            ghost_elements = _read_ghost_elements(f, is_ascii, data_size)
         elif environ == "Periodic":
             periodic = _read_periodic(f, is_ascii, data_size)
         elif environ == "NodeData":
@@ -98,6 +110,12 @@ def read_buffer(f, is_ascii: bool, data_size):
     cell_data = cell_data_from_raw(cells, cell_data_raw)
     cell_data.update(cell_tags)
 
+    if partitioned_entities is not None or ghost_elements is not None:
+        # The element tags are the identity of the cells in the file; they can be
+        # sparse and unordered. Keep them so that ghost element references and the
+        # element tags themselves survive a read-write round trip.
+        cell_data["gmsh:element_tags"] = element_tags
+
     # Add node entity information to the point data
     point_data.update({"gmsh:dim_tags": point_entities})
 
@@ -109,6 +127,8 @@ def read_buffer(f, is_ascii: bool, data_size):
         field_data=field_data,
         cell_sets=cell_sets,
         gmsh_periodic=periodic,
+        gmsh_partitioned_entities=partitioned_entities,
+        gmsh_ghost_elements=ghost_elements,
     )
 
 
@@ -139,6 +159,101 @@ def _read_entities(f, is_ascii: bool, data_size):
 
     _fast_forward_to_end_block(f, "Entities")
     return physical_tags, bounding_entities
+
+
+def _read_partitioned_entities(f, is_ascii: bool, data_size):
+    # Read the $PartitionedEntities section. Like $Entities, but each entity
+    # additionally carries a reference to its parent entity in the original
+    # (unpartitioned) geometry and the list of partitions it belongs to. The
+    # section is headed by the number of partitions and a list of ghost
+    # entities (entities owned by another partition).
+    #
+    # $PartitionedEntities
+    #   numPartitions(size_t)
+    #   numGhostEntities(size_t)
+    #     ghostEntityDim(int) ghostEntityTag(int) partition(int)
+    #     ...
+    #   numPoints(size_t) numCurves(size_t) numSurfaces(size_t) numVolumes(size_t)
+    #   pointTag(int) parentDim(int) parentTag(int)
+    #     numPartitions(size_t) partitionTag(int) ...
+    #     X(double) Y(double) Z(double)
+    #     numPhysicalTags(size_t) physicalTag(int) ...
+    #   ...
+    # $EndPartitionedEntities
+
+    fromfile = partial(np.fromfile, sep=" " if is_ascii else "")
+    c_size_t = _size_type(data_size)
+
+    (num_partitions,) = fromfile(f, c_size_t, 1)
+    (num_ghost_entities,) = fromfile(f, c_size_t, 1)
+    ghost_entities = []
+    for _ in range(num_ghost_entities):
+        dim, tag, partition = fromfile(f, c_int, 3)
+        ghost_entities.append((int(dim), int(tag), int(partition)))
+
+    physical_tags = ({}, {}, {}, {})
+    bounding_entities = ({}, {}, {}, {})
+    entities = {}
+    number = fromfile(f, c_size_t, 4)  # dims 0, 1, 2, 3
+    for d, n in enumerate(number):
+        for _ in range(n):
+            (tag,) = fromfile(f, c_int, 1)
+            parent_dim, parent_tag = fromfile(f, c_int, 2)
+            (num_entity_partitions,) = fromfile(f, c_size_t, 1)
+            partitions = fromfile(f, c_int, num_entity_partitions)
+            fromfile(f, c_double, 3 if d == 0 else 6)  # discard bounding-box
+            (num_physicals,) = fromfile(f, c_size_t, 1)
+            physical_tags[d][tag] = list(fromfile(f, c_int, num_physicals))
+            if d > 0:
+                # Number of bounding entities
+                num_BREP_ = fromfile(f, c_size_t, 1)[0]
+                # Store bounding entities
+                bounding_entities[d][tag] = fromfile(f, c_int, num_BREP_)
+            entities[(d, int(tag))] = {
+                "parent": (int(parent_dim), int(parent_tag)),
+                "partitions": [int(p) for p in partitions],
+            }
+
+    _fast_forward_to_end_block(f, "PartitionedEntities")
+
+    partitioned_entities = {
+        "num_partitions": int(num_partitions),
+        "ghost_entities": ghost_entities,
+        "entities": entities,
+    }
+    return physical_tags, bounding_entities, partitioned_entities
+
+
+def _read_ghost_elements(f, is_ascii: bool, data_size):
+    # Read the $GhostElements section:
+    #
+    # $GhostElements
+    #   numGhostElements(size_t)
+    #   elementTag(size_t) partition(int) numPartitions(size_t) partitionTag(int) ...
+    #   ...
+    # $EndGhostElements
+    #
+    # `partition` is the partition that owns the element, `partitionTag` the other
+    # partitions where the element appears as a ghost. The element tags refer to
+    # the tags in the $Elements section and can be sparse and unordered.
+
+    fromfile = partial(np.fromfile, sep=" " if is_ascii else "")
+    c_size_t = _size_type(data_size)
+
+    (num_ghost_elements,) = fromfile(f, c_size_t, 1)
+    ghost_elements = {}
+    for _ in range(num_ghost_elements):
+        (tag,) = fromfile(f, c_size_t, 1)
+        (partition,) = fromfile(f, c_int, 1)
+        (num_partitions,) = fromfile(f, c_size_t, 1)
+        partitions = fromfile(f, c_int, num_partitions)
+        ghost_elements[int(tag)] = (
+            int(partition),
+            [int(p) for p in partitions],
+        )
+
+    _fast_forward_to_end_block(f, "GhostElements")
+    return ghost_elements
 
 
 def _read_nodes(f, is_ascii: bool, data_size):
@@ -203,6 +318,7 @@ def _read_elements(
     data = []
     cell_data = {}
     cell_sets = {k: [None] * num_entity_blocks for k in field_data.keys()}
+    element_tags = []
 
     for k in range(num_entity_blocks):
         # entityDim(int) entityTag(int) elementType(int) numElements(size_t)
@@ -226,6 +342,9 @@ def _read_elements(
         d = fromfile(f, c_size_t, int(num_ele * (1 + num_nodes_per_ele))).reshape(
             (num_ele, -1)
         )
+        # The first column is the element tag. The tags are the identity of the
+        # elements in the file; they can be sparse and unordered.
+        element_tags.append(np.array(d[:, 0], dtype=np.int64))
 
         # Find physical tag, if defined; else it is None.
         pt = None if not physical_tags else physical_tags[dim][tag]
@@ -267,7 +386,7 @@ def _read_elements(
                 cell_sets["gmsh:bounding_entities"] = []
             cell_sets["gmsh:bounding_entities"].append(bound_entity)
 
-    return cells, cell_data, cell_sets
+    return cells, cell_data, cell_sets, element_tags
 
 
 def _read_periodic(f, is_ascii, data_size):
@@ -308,10 +427,18 @@ def write(filename, mesh, float_fmt=".16e", binary=True):
     tag_data = {}
     cell_data = {}
     for key, d in mesh.cell_data.items():
-        if key in ["gmsh:physical", "gmsh:geometrical", "cell_tags"]:
+        if key in [
+            "gmsh:physical",
+            "gmsh:geometrical",
+            "cell_tags",
+            "gmsh:element_tags",
+        ]:
             tag_data[key] = d
         else:
             cell_data[key] = d
+
+    # Check the consistency of the partitioning data before producing any output.
+    _validate_partitioning(mesh, tag_data)
 
     with open(filename, "wb") as fh:
         file_type = 1 if binary else 0
@@ -326,11 +453,16 @@ def write(filename, mesh, float_fmt=".16e", binary=True):
         if mesh.field_data:
             _write_physical_names(fh, mesh.field_data)
 
-        _write_entities(
-            fh, mesh.cells, tag_data, mesh.cell_sets, mesh.point_data, binary
-        )
+        if mesh.gmsh_partitioned_entities is not None:
+            _write_partitioned_entities(fh, mesh, tag_data, binary)
+        else:
+            _write_entities(
+                fh, mesh.cells, tag_data, mesh.cell_sets, mesh.point_data, binary
+            )
         _write_nodes(fh, mesh.points, mesh.cells, mesh.point_data, float_fmt, binary)
         _write_elements(fh, mesh.cells, tag_data, binary)
+        if mesh.gmsh_ghost_elements is not None:
+            _write_ghost_elements(fh, mesh.gmsh_ghost_elements, binary)
         if mesh.gmsh_periodic is not None:
             _write_periodic(fh, mesh.gmsh_periodic, float_fmt, binary)
 
@@ -523,6 +655,216 @@ def _write_entities(fh, cells, tag_data, cell_sets, point_data, binary):
     fh.write(b"$EndEntities\n")
 
 
+def _validate_partitioning(mesh, tag_data):
+    """Check the partitioning data of a mesh before anything is written.
+
+    The element tags (gmsh:element_tags in the cell data) are the identity of the
+    cells in the file; ghost elements refer to them. Parent entities of
+    partitioned entities must either be (0, 0) (no parent) or refer to another
+    partitioned entity.
+    """
+    cells = mesh.cells
+    if "gmsh:element_tags" in tag_data:
+        element_tags = tag_data["gmsh:element_tags"]
+        if len(element_tags) != len(cells):
+            raise WriteError(
+                f"gmsh:element_tags has {len(element_tags)} blocks, "
+                f"but the mesh has {len(cells)} cell blocks."
+            )
+        all_tags = []
+        for ci, (tags, cell_block) in enumerate(zip(element_tags, cells)):
+            if len(tags) != len(cell_block):
+                raise WriteError(
+                    f"gmsh:element_tags of cell block {ci} has length {len(tags)}, "
+                    f"but the block has {len(cell_block)} cells."
+                )
+            all_tags.append(np.asarray(tags).ravel())
+        all_tags = (
+            np.concatenate(all_tags)
+            if all_tags
+            else np.empty(0, dtype=np.int64)
+        )
+        if np.unique(all_tags).size != all_tags.size:
+            raise WriteError("Duplicate element tags in gmsh:element_tags.")
+    else:
+        # Without explicit element tags, the elements are numbered consecutively.
+        all_tags = np.arange(1, sum(len(c) for c in cells) + 1)
+
+    if mesh.gmsh_ghost_elements is not None:
+        known_tags = set(int(t) for t in all_tags)
+        missing = [
+            tag for tag in mesh.gmsh_ghost_elements if int(tag) not in known_tags
+        ]
+        if missing:
+            raise WriteError(
+                "gmsh: ghost elements refer to unknown element tags "
+                f"{sorted(missing)}."
+            )
+
+    if mesh.gmsh_partitioned_entities is not None:
+        entities = mesh.gmsh_partitioned_entities["entities"]
+        for (dim, tag), info in entities.items():
+            parent_dim, parent_tag = info["parent"]
+            if parent_dim == 0 and parent_tag == 0:
+                # no parent
+                continue
+            if (parent_dim, parent_tag) not in entities:
+                raise WriteError(
+                    f"gmsh: parent entity ({parent_dim}, {parent_tag}) of "
+                    f"partitioned entity ({dim}, {tag}) does not exist."
+                )
+
+
+def _write_partitioned_entities(fh, mesh, tag_data, binary):
+    """Write the $PartitionedEntities section, cf.
+    <http://gmsh.info/doc/texinfo/gmsh.html#MSH-file-format>.
+
+    $PartitionedEntities
+      numPartitions(size_t)
+      numGhostEntities(size_t)
+        ghostEntityDim(int) ghostEntityTag(int) partition(int)
+        ...
+      numPoints(size_t) numCurves(size_t) numSurfaces(size_t) numVolumes(size_t)
+      pointTag(int) parentDim(int) parentTag(int)
+        numPartitions(size_t) partitionTag(int) ...
+        X(double) Y(double) Z(double)
+        numPhysicalTags(size_t) physicalTag(int) ...
+      ...
+    $EndPartitionedEntities
+    """
+    partitioned = mesh.gmsh_partitioned_entities
+    entities = partitioned["entities"]
+    ghost_entities = partitioned.get("ghost_entities", [])
+    num_partitions = partitioned.get("num_partitions", 0)
+
+    # Map the entities to physical tags and bounding entities through the cell
+    # blocks, in the same way as _write_entities.
+    entity_block = {}
+    physical_tag = {}
+    if "gmsh:geometrical" in tag_data:
+        for ci, cell_block in enumerate(mesh.cells):
+            key = (cell_block.dim, int(tag_data["gmsh:geometrical"][ci][0]))
+            if key in entity_block:
+                raise WriteError("Encountered non-unique CellBlock dim_tag")
+            entity_block[key] = ci
+            if "gmsh:physical" in tag_data:
+                physical_tag[key] = int(tag_data["gmsh:physical"][ci][0])
+
+    bounding = {}
+    if "gmsh:bounding_entities" in mesh.cell_sets:
+        for key, ci in entity_block.items():
+            bounds = mesh.cell_sets["gmsh:bounding_entities"][ci]
+            if bounds is not None:
+                bounding[key] = [int(b) for b in bounds]
+
+    fh.write(b"$PartitionedEntities\n")
+
+    if binary:
+        np.array([num_partitions], dtype=c_size_t).tofile(fh)
+        np.array([len(ghost_entities)], dtype=c_size_t).tofile(fh)
+        for dim, tag, partition in ghost_entities:
+            np.array([dim, tag, partition], dtype=c_int).tofile(fh)
+    else:
+        fh.write(f"{num_partitions}\n".encode())
+        fh.write(f"{len(ghost_entities)}\n".encode())
+        for dim, tag, partition in ghost_entities:
+            fh.write(f"{dim} {tag} {partition}\n".encode())
+
+    # number of entities per dimension
+    num_occ = [0, 0, 0, 0]
+    for dim, _ in entities:
+        if not 0 <= dim <= 3:
+            raise WriteError(f"Encountered entity with invalid dimension {dim}")
+        num_occ[dim] += 1
+    if binary:
+        np.array(num_occ, dtype=c_size_t).tofile(fh)
+    else:
+        fh.write(f"{num_occ[0]} {num_occ[1]} {num_occ[2]} {num_occ[3]}\n".encode())
+
+    for dim, tag in sorted(entities):
+        info = entities[(dim, tag)]
+        parent_dim, parent_tag = info["parent"]
+        partitions = info["partitions"]
+
+        if binary:
+            np.array([tag, parent_dim, parent_tag], dtype=c_int).tofile(fh)
+            np.array([len(partitions)], dtype=c_size_t).tofile(fh)
+            if len(partitions) > 0:
+                np.array(partitions, dtype=c_int).tofile(fh)
+            np.zeros(3 if dim == 0 else 6, dtype=c_double).tofile(fh)
+        else:
+            parts = " ".join(str(p) for p in partitions)
+            fh.write(
+                f"{tag} {parent_dim} {parent_tag} {len(partitions)}".encode()
+            )
+            if parts:
+                fh.write(f" {parts}".encode())
+            if dim == 0:
+                fh.write(b" 0 0 0")
+            else:
+                fh.write(b" 0 0 0 0 0 0")
+
+        key = (dim, tag)
+        if key in physical_tag:
+            if binary:
+                np.array([1], dtype=c_size_t).tofile(fh)
+                np.array([physical_tag[key]], dtype=c_int).tofile(fh)
+            else:
+                fh.write(f" 1 {physical_tag[key]}".encode())
+        else:
+            if binary:
+                np.array([0], dtype=c_size_t).tofile(fh)
+            else:
+                fh.write(b" 0")
+
+        if dim > 0:
+            bounds = bounding.get(key, [])
+            if binary:
+                np.array([len(bounds)], dtype=c_size_t).tofile(fh)
+                if len(bounds) > 0:
+                    np.array(bounds, dtype=c_int).tofile(fh)
+            else:
+                fh.write(f" {len(bounds)}".encode())
+                for b in bounds:
+                    fh.write(f" {b}".encode())
+
+        if not binary:
+            fh.write(b"\n")
+
+    if binary:
+        fh.write(b"\n")
+    fh.write(b"$EndPartitionedEntities\n")
+
+
+def _write_ghost_elements(fh, ghost_elements, binary):
+    """Write the $GhostElements section.
+
+    $GhostElements
+      numGhostElements(size_t)
+      elementTag(size_t) partition(int) numPartitions(size_t) partitionTag(int) ...
+      ...
+    $EndGhostElements
+    """
+    fh.write(b"$GhostElements\n")
+    if binary:
+        np.array([len(ghost_elements)], dtype=c_size_t).tofile(fh)
+        for tag, (partition, partitions) in ghost_elements.items():
+            np.array([tag], dtype=c_size_t).tofile(fh)
+            np.array([partition], dtype=c_int).tofile(fh)
+            np.array([len(partitions)], dtype=c_size_t).tofile(fh)
+            if len(partitions) > 0:
+                np.array(partitions, dtype=c_int).tofile(fh)
+        fh.write(b"\n")
+    else:
+        fh.write(f"{len(ghost_elements)}\n".encode())
+        for tag, (partition, partitions) in ghost_elements.items():
+            fh.write(f"{tag} {partition} {len(partitions)}".encode())
+            for p in partitions:
+                fh.write(f" {p}".encode())
+            fh.write(b"\n")
+    fh.write(b"$EndGhostElements\n")
+
+
 def _write_nodes(fh, points, cells, point_data, float_fmt, binary):
     """Write node information.
 
@@ -642,8 +984,23 @@ def _write_elements(fh, cells, tag_data, binary: bool) -> None:
 
     total_num_cells = sum(len(c) for c in cells)
     num_blocks = len(cells)
-    min_element_tag = 1
-    max_element_tag = total_num_cells
+
+    # The element tags are the identity of the cells in the file. If they are
+    # given (gmsh:element_tags in the cell data, e.g. from a partitioned mesh),
+    # use them; they can be sparse and unordered. Otherwise, number the elements
+    # consecutively.
+    element_tags = tag_data.get("gmsh:element_tags")
+    if element_tags is not None:
+        nonempty = [np.asarray(t).ravel() for t in element_tags if len(t) > 0]
+        concat = (
+            np.concatenate(nonempty) if nonempty else np.empty(0, dtype=np.int64)
+        )
+        min_element_tag = int(concat.min()) if concat.size else 1
+        max_element_tag = int(concat.max()) if concat.size else 0
+    else:
+        min_element_tag = 1
+        max_element_tag = total_num_cells
+
     if binary:
         np.array(
             [num_blocks, total_num_cells, min_element_tag, max_element_tag],
@@ -671,6 +1028,11 @@ def _write_elements(fh, cells, tag_data, binary: bool) -> None:
             n = node_idcs.shape[0]
             np.array([n], dtype=c_size_t).tofile(fh)
 
+            if element_tags is not None:
+                tags = np.asarray(element_tags[ci], dtype=c_size_t)
+            else:
+                tags = np.arange(tag0, tag0 + n, dtype=c_size_t)
+
             if node_idcs.dtype != c_size_t:
                 warn(
                     f"Binary Gmsh cells need c_size_t (got {node_idcs.dtype}). "
@@ -680,7 +1042,7 @@ def _write_elements(fh, cells, tag_data, binary: bool) -> None:
 
             np.column_stack(
                 [
-                    np.arange(tag0, tag0 + n, dtype=c_size_t),
+                    tags,
                     # increment indices by one to conform with gmsh standard
                     node_idcs + 1,
                 ]
@@ -710,10 +1072,14 @@ def _write_elements(fh, cells, tag_data, binary: bool) -> None:
             cell_type = _meshio_to_gmsh_type[cell_block.type]
             n = len(cell_block.data)
             fh.write(f"{cell_block.dim} {entity_tag} {cell_type} {n}\n".encode())
+            if element_tags is not None:
+                tags = np.asarray(element_tags[ci])
+            else:
+                tags = np.arange(tag0, tag0 + n)
             np.savetxt(
                 fh,
                 # Gmsh indexes from 1 not 0
-                np.column_stack([np.arange(tag0, tag0 + n), node_idcs + 1]),
+                np.column_stack([tags, node_idcs + 1]),
                 "%d",
                 " ",
             )
