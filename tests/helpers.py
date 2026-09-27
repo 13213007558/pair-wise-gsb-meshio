@@ -697,7 +697,10 @@ def write_read(tmp_path, writer, reader, input_mesh, atol, extension=".dat"):
     def cell_sorter(cell):
         if cell.type.startswith("polyhedron"):
             # Polyhedra blocks should be well enough distinguished by their type
-            return cell.type
+            # Return a tuple here, too, to make the key comparable with the keys of
+            # other cell types (relevant for meshes that mix polyhedral and other
+            # cells).
+            return (cell.type, 0)
         else:
             return (cell.type, cell.data[0, 0])
 
