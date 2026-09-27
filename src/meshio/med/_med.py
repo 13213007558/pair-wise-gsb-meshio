@@ -8,7 +8,7 @@ import numpy as np
 from .._common import num_nodes_per_cell
 from .._exceptions import ReadError, WriteError
 from .._helpers import register_format
-from .._mesh import Mesh
+from .._mesh import Mesh, topological_dimension
 
 # https://docs.salome-platform.org/5/med/dev/med__outils_8hxx.html
 meshio_to_med_type = {
@@ -30,6 +30,26 @@ meshio_to_med_type = {
 }
 med_to_meshio_type = {v: k for k, v in meshio_to_med_type.items()}
 numpy_void_str = np.bytes_("")
+
+# MED geometric element type codes (dim * 100 + num_nodes), cf. med.h
+meshio_to_med_geo_type = {
+    "vertex": 1,
+    "line": 102,
+    "line3": 103,
+    "triangle": 203,
+    "triangle6": 206,
+    "quad": 204,
+    "quad8": 208,
+    "tetra": 304,
+    "tetra10": 310,
+    "hexahedron": 308,
+    "hexahedron20": 320,
+    "pyramid": 305,
+    "pyramid13": 313,
+    "wedge": 306,
+    "wedge15": 315,
+}
+med_geo_to_meshio_type = {v: k for k, v in meshio_to_med_geo_type.items()}
 
 
 def read(filename):
@@ -62,6 +82,12 @@ def read(filename):
     point_data = {}
     cell_data = {}
     field_data = {}
+    cell_data_localizations = {}
+
+    # Gauss point localizations (integration rules on the reference element)
+    localizations = {}
+    if "GAUSS" in f:
+        localizations = _read_localizations(f["GAUSS"])
 
     # Points
     pts_dataset = mesh["NOE"]["COO"]
@@ -109,7 +135,15 @@ def read(filename):
         pass
     else:
         profiles = f["PROFILS"] if "PROFILS" in f else None
-        _read_data(fields, profiles, cell_types, point_data, cell_data, field_data)
+        _read_data(
+            fields,
+            profiles,
+            cell_types,
+            point_data,
+            cell_data,
+            field_data,
+            cell_data_localizations,
+        )
 
     # Construct the mesh object
     mesh = Mesh(
@@ -117,10 +151,54 @@ def read(filename):
     )
     mesh.point_tags = point_tags
     mesh.cell_tags = cell_tags
+    mesh.localizations = localizations
+    mesh.cell_data_localizations = cell_data_localizations
     return mesh
 
 
-def _read_data(fields, profiles, cell_types, point_data, cell_data, field_data):
+def _read_localizations(gauss_group):
+    """Read Gauss point localizations from the GAUSS group. Each localization
+    maps a name to the reference element nodes, the Gauss point coordinates in
+    the reference element, and the corresponding weights.
+    """
+    localizations = {}
+    for name, group in gauss_group.items():
+        geo = int(group.attrs["GEO"])
+        dim = geo // 100
+        n_gauss = int(group.attrs["NBR"])
+        localizations[name] = {
+            "cell_type": med_geo_to_meshio_type[geo],
+            "ref_nodes": group["NOE"][()].reshape(-1, dim, order="F"),
+            "points": group["COO"][()].reshape(n_gauss, dim, order="F"),
+            "weights": group["PWG"][()],
+        }
+    return localizations
+
+
+def _read_localization_name(supp_group):
+    """Return the name of the Gauss localization attached to a field support,
+    or None if there is none.
+    """
+    for holder in (supp_group, supp_group[supp_group.attrs["PFL"].decode()]):
+        if "GAU" in holder.attrs:
+            gau = holder.attrs["GAU"]
+            if isinstance(gau, bytes):
+                gau = gau.decode()
+            gau = gau.strip("\x00").strip()
+            if gau:
+                return gau
+    return None
+
+
+def _read_data(
+    fields,
+    profiles,
+    cell_types,
+    point_data,
+    cell_data,
+    field_data,
+    cell_data_localizations,
+):
     for name, data in fields.items():
         if "NOM" in data.attrs:
             if "med:nom" not in field_data:
@@ -149,9 +227,17 @@ def _read_data(fields, profiles, cell_types, point_data, cell_data, field_data):
                     cell_index = cell_types.index(cell_type)
                     if name not in cell_data:
                         cell_data[name] = [None] * len(cell_types)
+                    supp_group = med_data[supp]
+                    loc_name = None
+                    if supp.startswith("MAI."):  # ELEM or ELGA data
+                        loc_name = _read_localization_name(supp_group)
                     cell_data[name][cell_index] = _read_cell_data(
-                        med_data[supp], profiles
+                        supp_group, profiles, keep_gauss_dim=loc_name is not None
                     )
+                    if loc_name is not None:
+                        if name not in cell_data_localizations:
+                            cell_data_localizations[name] = [None] * len(cell_types)
+                        cell_data_localizations[name][cell_index] = loc_name
 
 
 def _read_nodal_data(med_data, profiles):
@@ -171,7 +257,7 @@ def _read_nodal_data(med_data, profiles):
     return values
 
 
-def _read_cell_data(med_data, profiles):
+def _read_cell_data(med_data, profiles, keep_gauss_dim=False):
     profile = med_data.attrs["PFL"]
     data_profile = med_data[profile]
     n_cells = data_profile.attrs["NBR"]
@@ -189,8 +275,11 @@ def _read_cell_data(med_data, profiles):
         )
         values[index_profile] = values_profile
 
-    # Only 1 data point per cell, shape -> (n_cells, n_components)
-    if n_gauss_points == 1:
+    if keep_gauss_dim:
+        if values.shape[-1] == 1:  # cut off for scalars
+            values = values[:, :, 0]
+    elif n_gauss_points == 1:
+        # Only 1 data point per cell, shape -> (n_cells, n_components)
         values = values[:, 0, :]
         if values.shape[-1] == 1:  # cut off for scalars
             values = values[:, 0]
@@ -329,22 +418,57 @@ def write(filename, mesh):
         _write_data(fields, mesh_name, field_name, profile, name, supp, data)
 
     # Cell data
-    # Only support writing ELEM fields with only 1 Gauss point per cell
-    # Or ELNO (DG) fields defined at every node per cell
+    # ELEM fields have only 1 data point per cell, ELNO (DG) fields are defined
+    # at every node per cell, and ELGA fields are defined at the Gauss points of
+    # a localization (integration rule) attached to the field.
+    localizations = getattr(mesh, "localizations", None) or {}
+    cell_data_localizations = getattr(mesh, "cell_data_localizations", None) or {}
+
+    # First pass: determine the nature of every cell data array and collect the
+    # localizations that need to be written. Fail early if a field refers to a
+    # missing or incompatible localization.
+    cell_data_supp = {}
+    used_localizations = {}
     for name, d in mesh.cell_data.items():
         if name == "cell_tags":  # ignore cell_tags already written under FAS
             continue
-        for cell, data in zip(mesh.cells, d):
-            # Determine the nature of the cell data
-            # Either shape = (n_data, ) or (n_data, n_components) -> ELEM
-            # or shape = (n_data, n_gauss_points, n_components) -> ELNO or ELGA
-            med_type = meshio_to_med_type[cell.type]
-            if data.ndim <= 2:
-                supp = "ELEM"
+        loc_names = cell_data_localizations.get(name) or [None] * len(mesh.cells)
+        for k, (cell, data) in enumerate(zip(mesh.cells, d)):
+            loc_name = loc_names[k] if k < len(loc_names) else None
+            if loc_name is not None:
+                if loc_name not in localizations:
+                    raise WriteError(
+                        f"Cell data '{name}' refers to unknown "
+                        f"localization '{loc_name}'."
+                    )
+                loc = localizations[loc_name]
+                data = _check_localization(name, loc_name, loc, cell.type, data)
+                used_localizations[loc_name] = (loc, cell.type)
+                cell_data_supp[(name, k)] = ("ELGA", loc_name, data)
+            elif data.ndim <= 2:
+                cell_data_supp[(name, k)] = ("ELEM", None, data)
             elif data.shape[1] == num_nodes_per_cell[cell.type]:
-                supp = "ELNO"
-            else:  # general ELGA data defined at unknown Gauss points
-                supp = "ELGA"
+                cell_data_supp[(name, k)] = ("ELNO", None, data)
+            else:
+                raise WriteError(
+                    f"Cell data '{name}' has {data.shape[1]} data points per "
+                    f"'{cell.type}' cell, which matches neither the number of "
+                    f"cell nodes (ELNO) nor 1 (ELEM). Attach a Gauss "
+                    f"localization to the field to write it as ELGA data."
+                )
+
+    # Write the Gauss point localizations used by any field
+    if used_localizations:
+        gauss_group = f.create_group("GAUSS")
+        for loc_name, (loc, cell_type) in used_localizations.items():
+            _write_localization(gauss_group, loc_name, loc, cell_type)
+
+    for name, d in mesh.cell_data.items():
+        if name == "cell_tags":  # ignore cell_tags already written under FAS
+            continue
+        for k, (cell, data) in enumerate(zip(mesh.cells, d)):
+            supp, loc_name, data = cell_data_supp[(name, k)]
+            med_type = meshio_to_med_type[cell.type]
             field_name = field_names[name_idx] if field_names else None
             _write_data(
                 fields,
@@ -355,8 +479,76 @@ def write(filename, mesh):
                 supp,
                 data,
                 med_type,
+                loc_name,
             )
         name_idx += 1
+
+
+def _check_localization(field_name, loc_name, loc, cell_type, data):
+    """Check that a localization is compatible with the cell type and the field
+    data, and return the data reshaped to (n_cells, n_gauss_points, n_components).
+    """
+    try:
+        ref_nodes = np.asarray(loc["ref_nodes"], dtype=float)
+        points = np.asarray(loc["points"], dtype=float)
+        weights = np.asarray(loc["weights"], dtype=float)
+    except KeyError as err:
+        raise WriteError(
+            f"Localization '{loc_name}' of field '{field_name}' "
+            f"is missing the key {err}."
+        ) from err
+
+    dim = topological_dimension[cell_type]
+    n_ref_nodes = num_nodes_per_cell[cell_type]
+    if ref_nodes.shape != (n_ref_nodes, dim):
+        raise WriteError(
+            f"Localization '{loc_name}' of field '{field_name}' has reference "
+            f"nodes of shape {ref_nodes.shape}, expected ({n_ref_nodes}, {dim}) "
+            f"for cell type '{cell_type}'."
+        )
+    if weights.ndim != 1:
+        raise WriteError(
+            f"Localization '{loc_name}' of field '{field_name}' has weights of "
+            f"shape {weights.shape}, expected a one-dimensional array."
+        )
+    n_gauss = len(weights)
+    if points.shape != (n_gauss, dim):
+        raise WriteError(
+            f"Localization '{loc_name}' of field '{field_name}' has Gauss "
+            f"points of shape {points.shape}, expected ({n_gauss}, {dim})."
+        )
+    if "cell_type" in loc and loc["cell_type"] != cell_type:
+        raise WriteError(
+            f"Localization '{loc_name}' of field '{field_name}' is defined on "
+            f"'{loc['cell_type']}' cells, not on '{cell_type}' cells."
+        )
+
+    data = np.asarray(data)
+    if data.ndim == 1:
+        data = data[:, None, None]
+    elif data.ndim == 2:
+        if data.shape[1] == n_gauss:
+            data = data[:, :, None]  # scalar field at each Gauss point
+        else:
+            data = data[:, None, :]  # vector field at a single Gauss point
+    if data.shape[1] != n_gauss:
+        raise WriteError(
+            f"Field '{field_name}' has {data.shape[1]} data points per cell, "
+            f"but localization '{loc_name}' has {n_gauss} Gauss points."
+        )
+    return data
+
+
+def _write_localization(gauss_group, loc_name, loc, cell_type):
+    group = gauss_group.create_group(loc_name)
+    ref_nodes = np.asarray(loc["ref_nodes"], dtype=float)
+    points = np.asarray(loc["points"], dtype=float)
+    weights = np.asarray(loc["weights"], dtype=float)
+    group.attrs.create("NBR", len(weights))  # number of Gauss points
+    group.attrs.create("GEO", meshio_to_med_geo_type[cell_type])
+    group.create_dataset("NOE", data=ref_nodes.flatten(order="F"))
+    group.create_dataset("COO", data=points.flatten(order="F"))
+    group.create_dataset("PWG", data=weights)
 
 
 def _write_data(
@@ -368,11 +560,8 @@ def _write_data(
     supp,
     data,
     med_type=None,
+    loc_name=None,
 ):
-    # Skip for general ELGA fields defined at unknown Gauss points
-    if supp == "ELGA":
-        return
-
     # Field
     try:  # a same MED field may contain fields of different natures
         field = fields.create_group(name)
@@ -411,18 +600,26 @@ def _write_data(
         typ = time_step.create_group("NOE")
     elif supp == "ELNO":
         typ = time_step.create_group("NOE." + med_type)
-    else:  # 'ELEM' with only 1 Gauss points!
+    else:  # 'ELEM' with only 1 Gauss point or 'ELGA' with a localization
         typ = time_step.create_group("MAI." + med_type)
 
-    typ.attrs.create("GAU", numpy_void_str)  # no associated Gauss points
+    if supp == "ELGA":
+        typ.attrs.create("GAU", np.bytes_(loc_name))
+    else:
+        typ.attrs.create("GAU", numpy_void_str)  # no associated Gauss points
     typ.attrs.create("PFL", np.bytes_(profile))
     profile = typ.create_group(profile)
     profile.attrs.create("NBR", len(data))  # number of data
     if supp == "ELNO":
         profile.attrs.create("NGA", data.shape[1])
+    elif supp == "ELGA":
+        profile.attrs.create("NGA", data.shape[1])
     else:
         profile.attrs.create("NGA", 1)
-    profile.attrs.create("GAU", numpy_void_str)
+    if supp == "ELGA":
+        profile.attrs.create("GAU", np.bytes_(loc_name))
+    else:
+        profile.attrs.create("GAU", numpy_void_str)
 
     # Dataset
     profile.create_dataset("CO", data=data.flatten(order="F"))
