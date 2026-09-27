@@ -113,6 +113,59 @@ class CellBlock:
         return len(self.data)
 
 
+class GaussLocalization:
+    """Localization of Gauss (integration) points on a reference cell.
+
+    Stores the definition of a quadrature rule: the nodes of the reference
+    cell, the coordinates of the integration points within the reference
+    cell, and their weights. Fields reference a localization by name (see
+    Mesh.gauss_localizations and Mesh.cell_data_localizations), so a single
+    rule can be shared by several fields and different cell blocks can use
+    different rules.
+    """
+
+    def __init__(
+        self,
+        cell_type: str,
+        reference_points: ArrayLike,
+        gauss_points: ArrayLike,
+        weights: ArrayLike,
+    ):
+        self.cell_type = cell_type
+        self.reference_points = np.asarray(reference_points, dtype=float)
+        self.gauss_points = np.asarray(gauss_points, dtype=float)
+        self.weights = np.asarray(weights, dtype=float)
+
+        if self.reference_points.ndim != 2:
+            raise ValueError("reference_points must be a 2-dimensional array.")
+        if (
+            self.gauss_points.ndim != 2
+            or self.gauss_points.shape[1] != self.reference_points.shape[1]
+        ):
+            raise ValueError(
+                "gauss_points must be a 2-dimensional array with the same "
+                "coordinate dimension as reference_points."
+            )
+        if self.weights.shape != (len(self.gauss_points),):
+            raise ValueError(
+                "weights must be a 1-dimensional array with one entry per "
+                "Gauss point."
+            )
+
+    def __repr__(self):
+        items = [
+            "meshio GaussLocalization",
+            f"cell type: {self.cell_type}",
+            f"num reference points: {len(self.reference_points)}",
+            f"num Gauss points: {len(self.gauss_points)}",
+        ]
+        return "<" + ", ".join(items) + ">"
+
+    @property
+    def n_gauss_points(self):
+        return len(self.gauss_points)
+
+
 class Mesh:
     def __init__(
         self,
@@ -125,6 +178,8 @@ class Mesh:
         cell_sets: dict[str, list[ArrayLike]] | None = None,
         gmsh_periodic=None,
         info=None,
+        gauss_localizations: dict[str, GaussLocalization] | None = None,
+        cell_data_localizations: dict[str, list[str | None]] | None = None,
     ):
         self.points = np.asarray(points)
         if isinstance(cells, dict):
@@ -158,6 +213,12 @@ class Mesh:
         self.cell_sets = {} if cell_sets is None else cell_sets
         self.gmsh_periodic = gmsh_periodic
         self.info = info
+        self.gauss_localizations = (
+            {} if gauss_localizations is None else gauss_localizations
+        )
+        self.cell_data_localizations = (
+            {} if cell_data_localizations is None else cell_data_localizations
+        )
 
         # assert point data consistency and convert to numpy arrays
         for key, item in self.point_data.items():
@@ -184,6 +245,28 @@ class Mesh:
                         + f"Cell block {k} ('{self.cells[k].type}') "
                         + f"has length {len(self.cells[k])}, but "
                         + f"corresponding cell data item has length {len(data[k])}."
+                    )
+
+        # assert consistency of the Gauss localization references
+        for key, loc_names in self.cell_data_localizations.items():
+            if key not in self.cell_data:
+                raise ValueError(
+                    f"Gauss localizations defined for unknown cell data '{key}'."
+                )
+            if len(loc_names) != len(self.cells):
+                raise ValueError(
+                    f"Incompatible cell data localizations for '{key}'. "
+                    f"{len(self.cells)} cell blocks, but got "
+                    f"{len(loc_names)} localization references."
+                )
+            for loc_name in loc_names:
+                if (
+                    loc_name is not None
+                    and loc_name not in self.gauss_localizations
+                ):
+                    raise ValueError(
+                        f"Cell data '{key}' references unknown Gauss "
+                        f"localization '{loc_name}'."
                     )
 
     def __repr__(self):

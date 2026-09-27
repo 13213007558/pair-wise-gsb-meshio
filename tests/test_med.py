@@ -131,3 +131,177 @@ def test_reference_file_with_point_cell_data(tmp_path):
     assert np.isclose(np.mean(data_psi, axis=1)[0, 0], data_psi_elem[0])
 
     helpers.write_read(tmp_path, meshio.med.write, meshio.med.read, mesh, 1.0e-15)
+
+
+# Reference element nodes and quadrature rules used in the ELGA tests
+tri_ref_points = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+tri_gauss_points = np.array(
+    [[1.0 / 6.0, 1.0 / 6.0], [2.0 / 3.0, 1.0 / 6.0], [1.0 / 6.0, 2.0 / 3.0]]
+)
+tri_weights = np.full(3, 1.0 / 6.0)
+
+tet_ref_points = np.array(
+    [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+)
+_a = 0.585410196624969
+_b = 0.138196601125011
+tet_gauss_points = np.array(
+    [[_a, _b, _b], [_b, _a, _b], [_b, _b, _a], [_b, _b, _b]]
+)
+tet_weights = np.full(4, 1.0 / 24.0)
+
+
+def _elga_localizations():
+    return {
+        "tri_rule": meshio.GaussLocalization(
+            "triangle", tri_ref_points, tri_gauss_points, tri_weights
+        ),
+        "tet_rule": meshio.GaussLocalization(
+            "tetra", tet_ref_points, tet_gauss_points, tet_weights
+        ),
+    }
+
+
+def _elga_mesh():
+    points = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    cells = [
+        ("triangle", np.array([[0, 1, 2], [1, 3, 2]])),
+        ("tetra", np.array([[0, 1, 2, 4]])),
+    ]
+    rng = np.random.default_rng(0)
+    # Two fields sharing the same two localizations; each cell block uses its
+    # own rule. Note that the triangle rule has as many Gauss points as the
+    # cell has nodes, so it must not be mistaken for ELNO data.
+    cell_data = {
+        "sigma": [rng.random((2, 3, 2)), rng.random((1, 4, 2))],
+        "tau": [rng.random((2, 3, 1)), rng.random((1, 4, 1))],
+    }
+    cell_data_localizations = {
+        "sigma": ["tri_rule", "tet_rule"],
+        "tau": ["tri_rule", "tet_rule"],
+    }
+    return meshio.Mesh(
+        points,
+        cells,
+        cell_data=cell_data,
+        gauss_localizations=_elga_localizations(),
+        cell_data_localizations=cell_data_localizations,
+    )
+
+
+def test_elga_roundtrip(tmp_path):
+    mesh = _elga_mesh()
+    filepath = tmp_path / "elga.med"
+    meshio.med.write(filepath, mesh)
+
+    # The ELGA fields must be stored as MAI.<type> with a reference to the
+    # localization, not as ELNO (NOE.<type>) data
+    with h5py.File(filepath, "r") as f:
+        assert set(f["GAUSS"].keys()) == {"tri_rule", "tet_rule"}
+        for field_name in ("sigma", "tau"):
+            (step,) = f["CHA"][field_name].keys()
+            field = f["CHA"][field_name][step]
+            assert "NOE.TR3" not in field
+            assert "NOE.TE4" not in field
+            assert field["MAI.TR3"].attrs["GAU"].decode() == "tri_rule"
+            assert field["MAI.TE4"].attrs["GAU"].decode() == "tet_rule"
+
+    out = meshio.med.read(filepath)
+
+    # Localizations: name, reference nodes, Gauss points (order!), weights
+    assert set(out.gauss_localizations) == {"tri_rule", "tet_rule"}
+    tri_loc = out.gauss_localizations["tri_rule"]
+    assert tri_loc.cell_type == "triangle"
+    assert np.allclose(tri_loc.reference_points, tri_ref_points)
+    assert np.allclose(tri_loc.gauss_points, tri_gauss_points)
+    assert np.allclose(tri_loc.weights, tri_weights)
+    tet_loc = out.gauss_localizations["tet_rule"]
+    assert tet_loc.cell_type == "tetra"
+    assert np.allclose(tet_loc.reference_points, tet_ref_points)
+    assert np.allclose(tet_loc.gauss_points, tet_gauss_points)
+    assert np.allclose(tet_loc.weights, tet_weights)
+
+    # Fields explicitly refer to their localizations. The cell block order
+    # may differ from the input order, so compare per cell block type.
+    loc_of_type = {"triangle": "tri_rule", "tetra": "tet_rule"}
+    for name in ("sigma", "tau"):
+        for cell_block, loc_name in zip(out.cells, out.cell_data_localizations[name]):
+            assert loc_name == loc_of_type[cell_block.type]
+
+    # Field values
+    for name in ("sigma", "tau"):
+        data_in = dict(zip((c.type for c in mesh.cells), mesh.cell_data[name]))
+        for cell_block, data_out in zip(out.cells, out.cell_data[name]):
+            assert data_in[cell_block.type].shape == data_out.shape
+            assert np.allclose(data_in[cell_block.type], data_out)
+
+
+def test_elga_missing_localization(tmp_path):
+    # 2 points per triangle cell is neither ELNO nor ELEM; without an
+    # associated localization the field must not be skipped silently
+    points = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    cells = [("triangle", np.array([[0, 1, 2]]))]
+    cell_data = {"sigma": [np.ones((1, 2, 1))]}
+    mesh = meshio.Mesh(points, cells, cell_data=cell_data)
+    with pytest.raises(meshio.WriteError, match="sigma"):
+        meshio.med.write(tmp_path / "test.med", mesh)
+
+
+def test_elga_unknown_localization(tmp_path):
+    points = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    cells = [("triangle", np.array([[0, 1, 2]]))]
+    cell_data = {"sigma": [np.ones((1, 3, 1))]}
+    with pytest.raises(ValueError, match="no_such_rule"):
+        meshio.Mesh(
+            points,
+            cells,
+            cell_data=cell_data,
+            cell_data_localizations={"sigma": ["no_such_rule"]},
+        )
+
+
+def test_elga_incompatible_localization(tmp_path):
+    # The localization has 4 Gauss points, the data only 3
+    mesh = _elga_mesh()
+    mesh.gauss_localizations["tri_rule"] = meshio.GaussLocalization(
+        "triangle", tri_ref_points, tet_gauss_points[:, :2], tet_weights
+    )
+    with pytest.raises(meshio.WriteError, match="sigma"):
+        meshio.med.write(tmp_path / "test.med", mesh)
+
+    # The localization is defined for the wrong cell type
+    mesh = _elga_mesh()
+    mesh.cell_data_localizations = {
+        "sigma": ["tet_rule", "tet_rule"],
+        "tau": ["tri_rule", "tet_rule"],
+    }
+    with pytest.raises(meshio.WriteError, match="sigma"):
+        meshio.med.write(tmp_path / "test.med", mesh)
+
+
+def test_elno_without_localization(tmp_path):
+    # Data with one value per cell node and no localization reference is
+    # still written as ELNO
+    mesh = _elga_mesh()
+    mesh.cell_data = {"sigma": [mesh.cell_data["sigma"][0]]}
+    mesh.cells = mesh.cells[:1]
+    mesh.gauss_localizations = {}
+    mesh.cell_data_localizations = {}
+    filepath = tmp_path / "elno.med"
+    meshio.med.write(filepath, mesh)
+    with h5py.File(filepath, "r") as f:
+        assert "GAUSS" not in f
+        (step,) = f["CHA"]["sigma"].keys()
+        assert "NOE.TR3" in f["CHA"]["sigma"][step]
+    out = meshio.med.read(filepath)
+    assert out.gauss_localizations == {}
+    assert out.cell_data_localizations == {}
+    assert np.allclose(out.cell_data["sigma"][0], mesh.cell_data["sigma"][0])
