@@ -22,6 +22,7 @@ topological_dimension = {
     "tetra10": 3,
     "hexahedron27": 3,
     "wedge18": 3,
+    "wedge15": 3,
     "pyramid14": 3,
     "vertex": 0,
     "quad8": 2,
@@ -233,6 +234,22 @@ class Mesh:
 
     def copy(self):
         return copy.deepcopy(self)
+
+    def extract_boundary(self, material: str | None = None) -> Mesh:
+        """Extract the boundary surface mesh of the volume cells.
+
+        Returns a new mesh consisting of the faces on the outer boundary of
+        the volume cells (tetra, hexahedron, wedge, and their quadratic
+        variants). If 'material' is the name of an integer cell_data array,
+        faces between cells of different materials are included as well. The
+        boundary faces carry cell_data with the parent cell block, cell, and
+        local face index for both sides of the face. The input mesh is not
+        modified.
+        """
+        # avoid circular import
+        from ._boundary import extract_boundary
+
+        return extract_boundary(self, material=material)
 
     def write(self, path_or_buf, file_format: str | None = None, **kwargs):
         # avoid circular import
