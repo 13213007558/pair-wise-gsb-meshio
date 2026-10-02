@@ -21,6 +21,7 @@ topological_dimension = {
     "quad9": 2,
     "tetra10": 3,
     "hexahedron27": 3,
+    "wedge15": 3,
     "wedge18": 3,
     "pyramid14": 3,
     "vertex": 0,
@@ -233,6 +234,26 @@ class Mesh:
 
     def copy(self):
         return copy.deepcopy(self)
+
+    def extract_boundary(
+        self, material_name: str | None = None, include_interfaces: bool = True
+    ):
+        """Extract the boundary surface mesh of the 3D cells of this mesh.
+
+        Adjacent cells are identified by faces with identical complete node
+        topology (including higher-order mid nodes). Faces adjacent to a
+        single cell form the outer boundary; if material_name (a key of
+        cell_data) is given, faces between cells of different materials are
+        reported as internal interfaces, keeping both parent cells. The mesh
+        itself is not modified. See meshio._boundary.extract_boundary for
+        details on the returned cell data.
+        """
+        # avoid circular import
+        from ._boundary import extract_boundary
+
+        return extract_boundary(
+            self, material_name=material_name, include_interfaces=include_interfaces
+        )
 
     def write(self, path_or_buf, file_format: str | None = None, **kwargs):
         # avoid circular import
